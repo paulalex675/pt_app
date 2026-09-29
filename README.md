@@ -39,6 +39,10 @@ this or the scan will silently find nothing.
   maximum and average heart rate. Calories are estimates from average HR,
   duration, age, sex, and weight; they are unavailable when required client
   details or HR samples are missing.
+5. After ending, enter any resting HR values the clients provide. Blank values
+  leave the saved value unchanged. If an in-session reading exceeds a client's
+  current estimated or recorded max HR, that new high is saved and used for
+  their zone calculations in future sessions.
 
 ## Data
 

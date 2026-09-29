@@ -26,7 +26,7 @@ def load_client_thresholds(selected_client_id):
     if not client:
         return None
     age = db.client_age(client["dob"])
-    return zones.zone_thresholds(age, client["resting_hr"])
+    return zones.zone_thresholds(age, client["resting_hr"], client["max_hr"])
 
 
 CHART_MAX_PERCENT = 1.15
@@ -80,8 +80,9 @@ def format_session_duration(seconds):
 def main(page: ft.Page):
     page.title = "PT Studio"
     page.theme_mode = ft.ThemeMode.DARK
-    page.window.width = 900
-    page.window.height = 700
+    page.window.maximized = True
+    #page.window.width = 900
+    #page.window.height = 700
     page.padding = 0
     db.init_db()
 
@@ -176,6 +177,8 @@ def main(page: ft.Page):
                 subtitle_bits.append(c["sex"])
             if c["resting_hr"]:
                 subtitle_bits.append(f"RHR {c['resting_hr']}")
+            if c["max_hr"]:
+                subtitle_bits.append(f"Max HR {c['max_hr']}")
             is_selected = c["id"] == state["selected_client_id"]
             client_list_view.controls.append(
                 ft.ListTile(
@@ -271,6 +274,9 @@ def main(page: ft.Page):
     summary_session_times = ft.Text("Start: --    End: --    Duration: --", color=ft.Colors.GREY_400)
     summary_participant_rows = ft.Column(spacing=4)
     summary_empty_message = ft.Text("End a session to view its summary.", color=ft.Colors.GREY_400)
+    resting_hr_fields = {}
+    resting_hr_dialog_content = ft.Column(spacing=8, tight=True, scroll=ft.ScrollMode.AUTO, height=360)
+    resting_hr_error = ft.Text(color=ft.Colors.RED_300, visible=False)
     zone_legend = ft.Row(
         [ft.Row([ft.Container(width=10, height=10, bgcolor=zones.ZONE_COLORS[i], border_radius=2),
                  ft.Text(zones.ZONE_NAMES[i], size=11)], spacing=4) for i in range(5)],
@@ -284,7 +290,7 @@ def main(page: ft.Page):
         client = db.get_client(client_id)
         client_name = f"{client['first_name']} {client['last_name']}"
         age = db.client_age(client["dob"])
-        max_hr = zones.estimate_max_hr(age)
+        max_hr = client["max_hr"] or zones.estimate_max_hr(age)
         name_control = ft.Text(client_name, width=150, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
         hr_control = ft.Text("-- bpm", width=64, text_align=ft.TextAlign.RIGHT)
         bar_fill = ft.Container(left=0, top=5, width=0, height=24, bgcolor=zones.ZONE_COLORS[0], border_radius=3)
@@ -333,6 +339,9 @@ def main(page: ft.Page):
         participant = state["participants"].get(client_id)
         if not participant:
             return
+        if state["session_id"] and hr > participant["max_hr"]:
+            participant["max_hr"] = db.update_client_max_hr(client_id, hr) or hr
+            participant["thresholds"] = load_client_thresholds(client_id)
         zone_index = zones.zone_for_hr(hr, participant["thresholds"])
         participant["bar_fill"].width = CHART_WIDTH * chart_fill_fraction(hr, participant["max_hr"])
         participant["bar_fill"].bgcolor = zones.ZONE_COLORS[zone_index]
@@ -500,7 +509,72 @@ def main(page: ft.Page):
             )
         summary_empty_message.value = "No participant heart-rate samples were recorded." if participant_summaries else "No participant data recorded."
 
+    def finish_resting_hr_entry(e=None):
+        page.pop_dialog()
+        tabs.selected_index = 2
+        page.update()
+
+    def save_resting_hr_entries(e):
+        updates = []
+        try:
+            for client_id, field in resting_hr_fields.items():
+                raw_value = (field.value or "").strip()
+                if not raw_value:
+                    continue
+                resting_hr = int(raw_value)
+                if not 30 <= resting_hr <= 220:
+                    raise ValueError
+                updates.append((client_id, resting_hr))
+        except ValueError:
+            resting_hr_error.value = "Enter a resting heart rate from 30 to 220 bpm, or leave it blank."
+            resting_hr_error.visible = True
+            page.update()
+            return
+
+        for client_id, resting_hr in updates:
+            db.update_client_resting_hr(client_id, resting_hr)
+        refresh_client_list()
+        finish_resting_hr_entry()
+
+    resting_hr_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Record resting heart rate"),
+        content=ft.Column(
+            [
+                ft.Text("Enter any resting HR values provided. Leave others blank to keep their current values."),
+                resting_hr_dialog_content,
+                resting_hr_error,
+            ],
+            tight=True,
+            spacing=10,
+        ),
+        actions=[
+            ft.TextButton("Skip", on_click=finish_resting_hr_entry),
+            ft.FilledButton("Save", on_click=save_resting_hr_entries),
+        ],
+    )
+
+    def prompt_for_resting_hr(client_ids):
+        resting_hr_fields.clear()
+        resting_hr_dialog_content.controls.clear()
+        resting_hr_error.visible = False
+        for client_id in client_ids:
+            client = db.get_client(client_id)
+            if not client:
+                continue
+            client_name = f"{client['first_name']} {client['last_name']}"
+            field = ft.TextField(
+                label=f"{client_name} resting HR (bpm)",
+                value=str(client["resting_hr"]) if client["resting_hr"] else "",
+                keyboard_type=ft.KeyboardType.NUMBER,
+                width=320,
+            )
+            resting_hr_fields[client_id] = field
+            resting_hr_dialog_content.controls.append(field)
+        page.show_dialog(resting_hr_dialog)
+
     async def stop_session(e):
+        completed_client_ids = list(state["participants"])
         if state["session_id"]:
             completed_session_id = state["session_id"]
             db.end_session(completed_session_id)
@@ -520,9 +594,10 @@ def main(page: ft.Page):
         device_picker.value = None
         refresh_participant_chart()
         refresh_session_controls()
-        if state["last_session_id"]:
-            tabs.selected_index = 2
-        page.update()
+        if state["last_session_id"] and completed_client_ids:
+            prompt_for_resting_hr(completed_client_ids)
+        else:
+            page.update()
 
     start_btn.on_click = start_session
     stop_btn.on_click = stop_session

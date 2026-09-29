@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS clients (
     height_cm REAL,
     weight_kg REAL,
     resting_hr INTEGER,        -- nullable, bpm
+    max_hr INTEGER,            -- nullable, highest observed bpm
     created_at TEXT NOT NULL
 );
 
@@ -82,6 +83,9 @@ def get_conn() -> Iterator[sqlite3.Connection]:
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        client_columns = {row["name"] for row in conn.execute("PRAGMA table_info(clients)")}
+        if "max_hr" not in client_columns:
+            conn.execute("ALTER TABLE clients ADD COLUMN max_hr INTEGER")
         sample_columns = {row["name"] for row in conn.execute("PRAGMA table_info(hr_samples)")}
         if "client_id" not in sample_columns:
             conn.execute("ALTER TABLE hr_samples ADD COLUMN client_id TEXT REFERENCES clients(id)")
@@ -131,6 +135,25 @@ def get_client(client_id: str) -> sqlite3.Row | None:
         return conn.execute(
             "SELECT * FROM clients WHERE id = ?", (client_id,)
         ).fetchone()
+
+
+def update_client_resting_hr(client_id: str, resting_hr: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE clients SET resting_hr = ? WHERE id = ?",
+            (resting_hr, client_id),
+        )
+
+
+def update_client_max_hr(client_id: str, observed_hr: int) -> int | None:
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE clients SET max_hr = ?
+               WHERE id = ? AND (max_hr IS NULL OR max_hr < ?)""",
+            (observed_hr, client_id, observed_hr),
+        )
+        row = conn.execute("SELECT max_hr FROM clients WHERE id = ?", (client_id,)).fetchone()
+        return row["max_hr"] if row else None
 
 
 def client_age(dob_iso: str | None) -> int | None:

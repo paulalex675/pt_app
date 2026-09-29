@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import db
+import zones
 from main import (
     can_start_session,
     chart_fill_fraction,
@@ -27,6 +28,11 @@ class SessionLogicTests(unittest.TestCase):
         self.assertEqual(zone_for_hr(130, thresholds), 1)
         self.assertEqual(zone_for_hr(170, thresholds), 3)
 
+    def test_stored_max_hr_overrides_estimated_zone_thresholds(self):
+        thresholds = zones.zone_thresholds(30, 60, max_hr=205)
+        self.assertEqual(thresholds[-1], 205)
+        self.assertEqual(thresholds[0], round(60 + 0.5 * (205 - 60)))
+
     def test_chart_marker_is_at_max_hr_and_bar_allows_overrun(self):
         self.assertAlmostEqual(chart_marker_fraction(), 1 / 1.15)
         self.assertAlmostEqual(chart_fill_fraction(180, 180), 1 / 1.15)
@@ -43,6 +49,12 @@ class SessionLogicTests(unittest.TestCase):
             db.init_db()
             client_a = db.create_client("Ada", "North")
             client_b = db.create_client("Sam", "South")
+            self.assertIsNone(db.get_client(client_a)["max_hr"])
+            db.update_client_resting_hr(client_a, 54)
+            self.assertEqual(db.get_client(client_a)["resting_hr"], 54)
+            self.assertEqual(db.update_client_max_hr(client_a, 198), 198)
+            self.assertEqual(db.update_client_max_hr(client_a, 194), 198)
+            self.assertEqual(db.update_client_max_hr(client_a, 202), 202)
             session_id = db.start_session(client_a, "strap-a")
             started = db.get_session(session_id)["started_at"]
             db.add_session_participant(session_id, client_a, "strap-a")

@@ -24,9 +24,13 @@ def estimate_max_hr(age: int | None) -> int:
     return round(208 - 0.7 * age)
 
 
-def zone_thresholds(age: int | None, resting_hr: int | None) -> list[int]:
+def zone_thresholds(
+    age: int | None,
+    resting_hr: int | None,
+    max_hr: int | None = None,
+) -> list[int]:
     """Returns the 6 bpm boundaries [Z1 low, ..., Z5 high]."""
-    hr_max = estimate_max_hr(age)
+    hr_max = max_hr or estimate_max_hr(age)
     if resting_hr:
         hrr = hr_max - resting_hr
         return [round(resting_hr + b * hrr) for b in ZONE_BOUNDS]
