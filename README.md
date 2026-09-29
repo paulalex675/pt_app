@@ -12,6 +12,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
+Pinned to `flet==1.0.2`. Flet has changed its API significantly (and more
+than once) on the way to its 1.0 line, so **don't loosen this pin to `>=`**
+— a later release could rename things again exactly like it did between
+this app's first version and now. Bump the pin deliberately when you want
+to upgrade, and re-check the app still opens afterwards.
+
 On first Bluetooth connection, macOS will prompt for Bluetooth permission
 for whichever app is running the script (Terminal, VS Code, etc.) — accept
 this or the scan will silently find nothing.

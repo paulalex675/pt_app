@@ -81,8 +81,7 @@ def main(page: ft.Page):
     f_error = ft.Text(color=ft.Colors.RED_300, visible=False)
 
     def close_dialog(e=None):
-        add_client_dialog.open = False
-        page.update()
+        page.pop_dialog()
 
     def save_client(e):
         if not f_first.value or not f_last.value:
@@ -122,7 +121,7 @@ def main(page: ft.Page):
     )
 
     def open_add_client(e):
-        page.open(add_client_dialog)
+        page.show_dialog(add_client_dialog)
 
     clients_tab = ft.Column(
         [
@@ -256,7 +255,7 @@ def main(page: ft.Page):
                     [hr_display, zone_label, elapsed_text],
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4,
                 ),
-                alignment=ft.alignment.center, padding=30,
+                alignment=ft.Alignment.CENTER, padding=30,
             ),
             ft.Row([start_btn, stop_btn], alignment=ft.MainAxisAlignment.CENTER, spacing=20),
             ft.Divider(),
@@ -271,16 +270,31 @@ def main(page: ft.Page):
     # LAYOUT
     # ==================================================================
     tabs = ft.Tabs(
+        length=2,
         selected_index=0,
-        tabs=[
-            ft.Tab(text="Clients", icon=ft.Icons.PEOPLE, content=ft.Container(clients_tab, padding=20)),
-            ft.Tab(text="Session", icon=ft.Icons.FAVORITE, content=ft.Container(session_tab, padding=20)),
-        ],
         expand=True,
+        content=ft.Column(
+            expand=True,
+            controls=[
+                ft.TabBar(
+                    tabs=[
+                        ft.Tab(label="Clients", icon=ft.Icons.PEOPLE),
+                        ft.Tab(label="Session", icon=ft.Icons.FAVORITE),
+                    ]
+                ),
+                ft.TabBarView(
+                    expand=True,
+                    controls=[
+                        ft.Container(clients_tab, padding=20),
+                        ft.Container(session_tab, padding=20),
+                    ],
+                ),
+            ],
+        ),
     )
     page.add(tabs)
     refresh_client_list()
 
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(main)

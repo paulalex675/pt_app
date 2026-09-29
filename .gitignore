@@ -1,0 +1,19 @@
+# Virtual environment
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Client data — never commit this
+pt_studio.db
+pt_studio.db-journal
+
+# Flet build artifacts
+build/
+
+# OS cruft
+.DS_Store
