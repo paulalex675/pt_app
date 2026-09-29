@@ -6,8 +6,10 @@ session_id for the bronze layer).
 """
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
+from typing import Iterator
 
 DB_PATH = Path(__file__).parent / "pt_studio.db"
 
@@ -33,26 +35,63 @@ CREATE TABLE IF NOT EXISTS sessions (
     notes TEXT
 );
 
+CREATE TABLE IF NOT EXISTS client_device_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id TEXT NOT NULL REFERENCES clients(id),
+    device_address TEXT NOT NULL,
+    device_name TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(client_id, device_address)
+);
+
 CREATE TABLE IF NOT EXISTS hr_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
+    client_id TEXT REFERENCES clients(id),
+    strap_device_id TEXT,
     ts TEXT NOT NULL,          -- ISO timestamp, UTC
     hr INTEGER NOT NULL,
     rr_intervals TEXT          -- JSON-encoded list of ms floats, nullable
 );
+
+CREATE TABLE IF NOT EXISTS session_participants (
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    client_id TEXT NOT NULL REFERENCES clients(id),
+    strap_device_id TEXT NOT NULL,
+    PRIMARY KEY (session_id, client_id),
+    UNIQUE (session_id, strap_device_id)
+);
 """
 
 
-def get_conn() -> sqlite3.Connection:
+@contextmanager
+def get_conn() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        sample_columns = {row["name"] for row in conn.execute("PRAGMA table_info(hr_samples)")}
+        if "client_id" not in sample_columns:
+            conn.execute("ALTER TABLE hr_samples ADD COLUMN client_id TEXT REFERENCES clients(id)")
+        if "strap_device_id" not in sample_columns:
+            conn.execute("ALTER TABLE hr_samples ADD COLUMN strap_device_id TEXT")
+        conn.execute(
+            """INSERT OR IGNORE INTO session_participants (session_id, client_id, strap_device_id)
+               SELECT id, client_id, strap_device_id FROM sessions
+               WHERE strap_device_id IS NOT NULL"""
+        )
 
 
 # ---------- clients ----------
@@ -122,11 +161,101 @@ def end_session(session_id: str, notes: str = "") -> None:
         )
 
 
-def log_sample(session_id: str, hr: int, rr_intervals_json: str | None) -> None:
+def get_session(session_id: str) -> sqlite3.Row | None:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+
+
+def session_summary(session_id: str) -> tuple[sqlite3.Row | None, list[sqlite3.Row]]:
+    with get_conn() as conn:
+        session = conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if session is None:
+            return None, []
+        participants = conn.execute(
+            """SELECT c.id AS client_id, c.first_name, c.last_name, c.sex, c.dob,
+                      c.weight_kg,
+                      MAX(h.hr) AS max_hr,
+                      AVG(h.hr) AS average_hr,
+                      COUNT(h.id) AS sample_count
+               FROM clients AS c
+               LEFT JOIN session_participants AS sp
+                 ON sp.session_id = ? AND sp.client_id = c.id
+               LEFT JOIN hr_samples AS h
+                 ON h.session_id = ?
+                AND (h.client_id = c.id OR (h.client_id IS NULL AND c.id = ?))
+                AND (sp.strap_device_id IS NULL OR h.strap_device_id IS NULL
+                     OR h.strap_device_id = sp.strap_device_id)
+               WHERE sp.session_id = ? OR c.id = ?
+               GROUP BY c.id
+               ORDER BY c.first_name, c.last_name""",
+            (session_id, session_id, session["client_id"], session_id, session["client_id"]),
+        ).fetchall()
+        return session, participants
+
+
+def add_session_participant(session_id: str, client_id: str, strap_device_id: str) -> None:
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO hr_samples (session_id, ts, hr, rr_intervals) VALUES (?, ?, ?, ?)",
-            (session_id, datetime.utcnow().isoformat(), hr, rr_intervals_json),
+            """INSERT OR IGNORE INTO session_participants (session_id, client_id, strap_device_id)
+               VALUES (?, ?, ?)""",
+            (session_id, client_id, strap_device_id),
+        )
+
+
+def list_session_participants(session_id: str) -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT sp.client_id, sp.strap_device_id, c.first_name, c.last_name
+               FROM session_participants AS sp
+               JOIN clients AS c ON c.id = sp.client_id
+               WHERE sp.session_id = ? ORDER BY c.first_name, c.last_name""",
+            (session_id,),
+        ).fetchall()
+
+
+def add_client_device_binding(client_id: str, device_address: str, device_name: str | None = None) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO client_device_bindings (client_id, device_address, device_name, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(client_id, device_address) DO UPDATE SET device_name = excluded.device_name
+            """,
+            (client_id, device_address, device_name, datetime.utcnow().isoformat()),
+        )
+
+
+def list_client_device_bindings() -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM client_device_bindings ORDER BY client_id, device_address"
+        ).fetchall()
+
+
+def get_client_device_binding(client_id: str, device_address: str) -> sqlite3.Row | None:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM client_device_bindings WHERE client_id = ? AND device_address = ?",
+            (client_id, device_address),
+        ).fetchone()
+
+
+def log_sample(
+    session_id: str,
+    hr: int,
+    rr_intervals_json: str | None,
+    client_id: str | None = None,
+    strap_device_id: str | None = None,
+) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO hr_samples (session_id, client_id, strap_device_id, ts, hr, rr_intervals)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, client_id, strap_device_id, datetime.utcnow().isoformat(), hr, rr_intervals_json),
         )
 
 

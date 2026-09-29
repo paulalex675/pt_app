@@ -1,7 +1,7 @@
 # PT Studio — live heart rate app
 
-A desktop app (macOS/Windows/Linux) for running PT sessions with a single
-Polar H10 pod, shared between clients with personal straps.
+A desktop app (macOS/Windows/Linux) for running PT sessions with multiple
+clients and BLE heart-rate straps at the same time.
 
 ## Setup
 
@@ -27,25 +27,33 @@ this or the scan will silently find nothing.
 1. **Clients tab** — add a client (first/last name required; sex, DOB,
    height, weight and resting HR are all optional but recommended, since
    they drive the zone calculation).
-2. **Session tab** — pick the client, put the H10 pod on their strap, tap
-   **Scan for strap** (the strap needs skin contact to wake up and start
-   advertising), then **Start session** once connected.
-3. Live heart rate, current zone and time-in-zone are shown while the
-   session runs. **End session** closes it out in the database.
+2. **Session tab** — scan for straps, then select an available client and
+  device and choose **Attach client to device**. Repeat to add participants;
+  already attached clients and devices are removed from the selectors.
+3. Choose **Start session** to record the participants. Each client's live
+  heart rate appears beside a bar positioned by percent of estimated max HR;
+  the fill color follows their current training zone. The dotted line marks
+  100%, and bars can extend to 115%. **End session** closes it out.
+4. Ending a session records its UTC end time and opens **Summary**. The
+  summary shows the stored start/end times, duration, and each participant's
+  maximum and average heart rate. Calories are estimates from average HR,
+  duration, age, sex, and weight; they are unavailable when required client
+  details or HR samples are missing.
 
 ## Data
 
-Everything is stored locally in `pt_studio.db` (SQLite), in three tables:
-`clients`, `sessions`, `hr_samples`. This is meant to be the source you
+Everything is stored locally in `pt_studio.db` (SQLite), in tables including
+`clients`, `sessions`, `session_participants`, and `hr_samples`. Samples retain
+their client and strap identifiers. This is meant to be the source you
 later export from and push into your S3 bronze layer — each session's
 samples can be pulled with `db.session_samples(session_id)` and written out
 as JSON/CSV for upload.
 
 ## Known limits (v1)
 
-- One BLE connection at a time — fine for a single H10 pod, but it means
-  no two simultaneous live sessions. A second pod just needs a second
-  `HeartRateStream` instance wired into the UI.
+- The app opens one BLE connection per attached participant. Bluetooth
+  adapter and operating-system limits may constrain the number of simultaneous
+  straps.
 - `scan_for_straps()` connects to the first HR-capable device it finds.
   If other BLE heart rate devices are ever in range at the same time,
   narrow the scan by matching `device.name` for "Polar".

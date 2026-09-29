@@ -34,7 +34,15 @@ def zone_thresholds(age: int | None, resting_hr: int | None) -> list[int]:
 
 
 def zone_for_hr(hr: int, thresholds: list[int]) -> int:
-    """Returns zone index 0-4 (Z1-Z5), clamped at the edges."""
+    """Returns zone index 0-4 (Z1-Z5), clamped at the edges.
+
+    Any value below the first threshold is treated as the lowest zone (Z1)
+    so a resting HR still maps to a valid zone instead of falling through.
+    """
+    if not thresholds:
+        return 0
+    if hr < thresholds[0]:
+        return 0
     for i in range(5):
         if hr <= thresholds[i + 1]:
             return i
