@@ -51,3 +51,28 @@ def zone_for_hr(hr: int, thresholds: list[int]) -> int:
         if hr <= thresholds[i + 1]:
             return i
     return 4
+
+
+# A chest strap can spike (dry electrodes, movement). A new max HR is only saved
+# if it is physiologically plausible AND held for several consecutive readings.
+MAX_PLAUSIBLE_HR = 220
+NEW_MAX_CONFIRM_READINGS = 3
+
+
+def track_new_max(streak: dict, hr: int, current_max: int) -> int | None:
+    """Tracks consecutive readings above current_max.
+
+    `streak` is a small mutable dict owned by the caller. Returns the confirmed
+    new max (the lowest reading in the streak) once enough consecutive plausible
+    readings exceed current_max, otherwise None.
+    """
+    if current_max < hr <= MAX_PLAUSIBLE_HR:
+        streak["count"] = streak.get("count", 0) + 1
+        streak["floor"] = hr if streak["count"] == 1 else min(streak["floor"], hr)
+        if streak["count"] >= NEW_MAX_CONFIRM_READINGS:
+            confirmed = streak["floor"]
+            streak["count"] = 0
+            return confirmed
+        return None
+    streak["count"] = 0
+    return None

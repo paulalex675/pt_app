@@ -53,13 +53,68 @@ later export from and push into your S3 bronze layer — each session's
 samples can be pulled with `db.session_samples(session_id)` and written out
 as JSON/CSV for upload.
 
+## Cloud pipeline and dashboard
+
+```
+End session -> Export to cloud -> S3 bronze -> Lambda -> S3 silver + gold -> API Lambda -> dashboard/index.html
+```
+
+- **bronze/** — one JSON record **per session per client**, exactly as recorded
+  (`bronze/client_id=<id>/<session_id>.json`). A three-person session uploads three
+  records. Records are pseudonymous: client id only (no name) and age at the session
+  rather than date of birth.
+- **silver/** — one computed summary per session per client (duration, avg/max/min HR,
+  time in each zone). Zones use the client's recorded max HR when there is one.
+  Gaps longer than 30s (strap dropouts) are not credited to any zone.
+- **gold/** — one rolling summary per client, read by the dashboard API.
+
+No Glue or Athena: those suit the Apple Health pipeline's multi-million-row XML, not
+one small JSON record per client per session. One Lambda is simpler to run and debug.
+
+### Deploy
+
+Needs the AWS SAM CLI and credentials (`aws configure`).
+
+```bash
+cd infra
+sam build
+sam deploy --guided      # give BucketNameSuffix something unique (e.g. initials)
+```
+
+Then:
+
+1. Set `PT_STUDIO_BUCKET` to the `BucketName` output (and optionally `PT_STUDIO_REGION`,
+   default `eu-west-2`) before running `python main.py`.
+2. In `dashboard/index.html`, set `API_BASE` to the `ApiUrl` output and `CLIENT_ID` to
+   a client's id (`sqlite3 pt_studio.db "select id, first_name from clients;"`).
+3. End a session, open the **Summary** tab, press **Export to cloud**, then open
+   `dashboard/index.html`.
+
+### Erasing a client (UK GDPR)
+
+```bash
+python -c "import export; print(export.delete_client_data('<client_id>'), 'objects deleted')"
+```
+
+This removes the client's bronze, silver and gold objects. S3 versioning is
+deliberately **off** in the template — with versioning, a delete only adds a marker and
+the data stays recoverable. Also delete the client from the local `pt_studio.db`.
+Note that the local database still holds names and dates of birth.
+
+### Before this goes public
+
+The dashboard is unauthenticated and the API allows any origin. Fine for a private
+screenshot; before a real client uses it, add a login and narrow
+`Access-Control-Allow-Origin` in `lambda/api_summary.py` to your site's domain.
+
+Tests: `pip install -r requirements-dev.txt` then `python -m unittest discover -s tests`.
+
 ## Known limits (v1)
 
 - The app opens one BLE connection per attached participant. Bluetooth
   adapter and operating-system limits may constrain the number of simultaneous
   straps.
-- `scan_for_straps()` connects to the first HR-capable device it finds.
-  If other BLE heart rate devices are ever in range at the same time,
+- `scan_for_straps()` lists every HR-capable device in range, so in a busy gym
   narrow the scan by matching `device.name` for "Polar".
 - No auth/login yet — this is the private, in-studio tool. A client-facing
   login and dashboard is a separate, later build on top of the same data.

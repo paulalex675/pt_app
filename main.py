@@ -5,6 +5,7 @@ Requires a Polar H10 (or other standard BLE HRM) paired/discoverable, and
 Bluetooth permission granted to the terminal/IDE running this (macOS will
 prompt on first connect).
 """
+import asyncio
 import time
 from datetime import datetime
 
@@ -146,13 +147,11 @@ def main(page: ft.Page):
 
     def set_selected_client(value):
         state["selected_client_id"] = value
-        print(f"DEBUG: selected client set to {state['selected_client_id']}")
         refresh_session_controls()
         page.update()
 
     def set_selected_device(value):
         state["selected_device_address"] = value
-        print(f"DEBUG: selected device set to {state['selected_device_address']}")
         refresh_session_controls()
         page.update()
 
@@ -323,6 +322,7 @@ def main(page: ft.Page):
             "max_hr": max_hr,
             "thresholds": load_client_thresholds(client_id),
             "last_sample_time": None,
+            "max_streak": {},
             "bar_fill": bar_fill,
             "value_control": value_control,
             "hr_control": hr_control,
@@ -339,9 +339,11 @@ def main(page: ft.Page):
         participant = state["participants"].get(client_id)
         if not participant:
             return
-        if state["session_id"] and hr > participant["max_hr"]:
-            participant["max_hr"] = db.update_client_max_hr(client_id, hr) or hr
-            participant["thresholds"] = load_client_thresholds(client_id)
+        if state["session_id"]:
+            confirmed_max = zones.track_new_max(participant["max_streak"], hr, participant["max_hr"])
+            if confirmed_max:
+                participant["max_hr"] = db.update_client_max_hr(client_id, confirmed_max) or confirmed_max
+                participant["thresholds"] = load_client_thresholds(client_id)
         zone_index = zones.zone_for_hr(hr, participant["thresholds"])
         participant["bar_fill"].width = CHART_WIDTH * chart_fill_fraction(hr, participant["max_hr"])
         participant["bar_fill"].bgcolor = zones.ZONE_COLORS[zone_index]
@@ -364,7 +366,6 @@ def main(page: ft.Page):
         page.update()
 
     def on_hr_sample(client_id, hr: int, rr_intervals: list[float]):
-        print(f"DEBUG: received HR sample client={client_id} hr={hr}, rr_count={len(rr_intervals)}")
         apply_participant_sample(client_id, hr, rr_intervals)
 
     async def do_scan(e):
@@ -467,7 +468,6 @@ def main(page: ft.Page):
             )
         state["session_start"] = time.monotonic()
         start_session_error.visible = False
-        print(f"DEBUG: session started with participants={len(state['participants'])}")
         refresh_session_controls()
         page.update()
 
@@ -580,6 +580,8 @@ def main(page: ft.Page):
             db.end_session(completed_session_id)
             state["last_session_id"] = completed_session_id
             refresh_summary_screen(completed_session_id)
+            export_btn.disabled = False
+            export_status.value = ""
         state["session_id"] = None
         state["session_start"] = None
         for participant in state["participants"].values():
@@ -632,6 +634,31 @@ def main(page: ft.Page):
         expand=True,
     )
 
+    export_status = ft.Text("", size=12, color=ft.Colors.GREY_400)
+
+    async def export_last_session(e):
+        session_id = state["last_session_id"]
+        if not session_id:
+            return
+        export_btn.disabled = True
+        export_status.value = "Uploading..."
+        export_status.color = ft.Colors.GREY_400
+        page.update()
+        try:
+            import export as export_module
+            keys = await asyncio.to_thread(export_module.upload_session, session_id)
+            export_status.value = f"Uploaded {len(keys)} client record(s)."
+            export_status.color = ft.Colors.GREEN_400
+        except Exception as ex:
+            export_status.value = f"Upload failed: {ex}"
+            export_status.color = ft.Colors.RED_300
+            export_btn.disabled = False
+        page.update()
+
+    export_btn = ft.OutlinedButton(
+        "Export to cloud", icon=ft.Icons.CLOUD_UPLOAD, disabled=True, on_click=export_last_session
+    )
+
     summary_tab = ft.Column(
         [
             summary_session_title,
@@ -648,6 +675,7 @@ def main(page: ft.Page):
             ),
             summary_participant_rows,
             summary_empty_message,
+            ft.Row([export_btn, export_status], spacing=12),
             ft.Text(
                 "Calories are estimates based on average heart rate, session duration, age, sex, and weight.",
                 size=11,
