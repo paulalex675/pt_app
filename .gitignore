@@ -17,3 +17,5 @@ build/
 
 # OS cruft
 .DS_Store
+# SAM build output
+.aws-sam/
