@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "pt-studio"
+resolve_s3 = true
+s3_prefix = "pt-studio"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "BucketNameSuffix=\"pr-8431\""
+image_repositories = []
+
+[default.global.parameters]
+region = "eu-west-2"

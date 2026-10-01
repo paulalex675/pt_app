@@ -26,6 +26,10 @@ Resources:
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
 
+  # NOTE: this function is triggered by DataBucket, so it must NOT use !Ref DataBucket
+  # anywhere (env vars, policies). SAM makes the bucket depend on the function's invoke
+  # permission, so a !Ref back to the bucket creates a circular dependency. Use the
+  # constructed bucket name (the !Sub below) instead.
   SilverTransformFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -36,10 +40,10 @@ Resources:
       MemorySize: 256
       Policies:
         - S3CrudPolicy:
-            BucketName: !Ref DataBucket
+            BucketName: !Sub "pt-studio-data-${BucketNameSuffix}"
       Environment:
         Variables:
-          BUCKET_NAME: !Ref DataBucket
+          BUCKET_NAME: !Sub "pt-studio-data-${BucketNameSuffix}"
       Events:
         BronzeUpload:
           Type: S3
