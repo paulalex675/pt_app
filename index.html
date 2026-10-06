@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your progress | Paul [Surname]</title>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,500..900&family=Source+Sans+3:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#101a22; --panel:#182631; --line:#25384a; --text:#eaefec; --mute:#9fb0ba;
+  --z2:#3fbfad; --z4:#f2a93b; --z5:#e5484d;
+  --head:"Archivo",system-ui,sans-serif; --body:"Source Sans 3",system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--text);font:400 1.05rem/1.6 var(--body);padding:clamp(1.5rem,5vw,3rem);max-width:60rem;margin:0 auto}
+h1,h2{font-family:var(--head);letter-spacing:-.01em}
+h1{font-size:clamp(1.8rem,4vw,2.6rem);font-weight:800;margin-bottom:.25rem}
+.sub{color:var(--mute);margin-bottom:2rem}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:1.5rem;margin-bottom:1.25rem}
+.stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.25rem}
+.stat-grid .card{margin-bottom:0;text-align:center}
+.stat-grid dt{color:var(--mute);font-size:.85rem}
+.stat-grid dd{font:800 clamp(1.3rem,3vw,2rem) var(--head);margin-top:.25rem}
+.zone-row{display:grid;grid-template-columns:6.5rem 1fr 3rem;gap:.8rem;align-items:center;margin-bottom:.6rem;font-size:.95rem}
+.zone-row b{text-align:right}
+.zone-track{height:12px;background:var(--line);border-radius:6px;overflow:hidden}
+.zone-track i{display:block;height:100%;border-radius:6px}
+.session-list{list-style:none;padding:0}
+.session-list li{display:flex;justify-content:space-between;padding:.7rem 0;border-top:1px solid var(--line);font-size:.95rem}
+.session-list li:first-child{border-top:none}
+.session-list .date{color:var(--mute)}
+.state{color:var(--mute);text-align:center;padding:3rem 1rem}
+.elite-legend{color:var(--mute);font-size:.85rem;margin:.25rem 0 1rem}
+.elite-row{display:grid;grid-template-columns:5.5rem 1fr 3.5rem;gap:.8rem;align-items:center;margin-bottom:.7rem;font-size:.95rem}
+.elite-row b{text-align:right}
+.elite-track{position:relative;height:14px;background:var(--line);border-radius:7px}
+.elite-track i{display:block;height:100%;border-radius:7px;background:var(--z2)}
+.elite-track i.partial{background:var(--mute)}
+.elite-target{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--z4)}
+.elite-table{width:100%;border-collapse:collapse;font-size:.9rem}
+.elite-table th,.elite-table td{padding:.45rem .5rem;text-align:right;border-top:1px solid var(--line);white-space:nowrap}
+.elite-table th:first-child,.elite-table td:first-child{text-align:left}
+.elite-table th{color:var(--mute);font-weight:600;border-top:none}
+</style>
+</head>
+<body>
+
+<h1>Your training data</h1>
+<p class="sub" id="subtitle">Loading your sessions…</p>
+
+<div id="content" style="display:none">
+  <div class="stat-grid">
+    <div class="card"><dt>Sessions logged</dt><dd id="stat-sessions">-</dd></div>
+    <div class="card"><dt>Avg. session</dt><dd id="stat-duration">-</dd></div>
+    <div class="card"><dt>Avg. heart rate</dt><dd id="stat-avghr">-</dd></div>
+    <div class="card"><dt>Last session</dt><dd id="stat-last">-</dd></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-bottom:1rem;font-size:1.2rem">Typical time in zone</h2>
+    <div id="zone-bars"></div>
+  </div>
+
+  <div class="card" id="elite-card" style="display:none">
+    <h2 style="margin-bottom:0;font-size:1.2rem">Elite training</h2>
+    <p class="elite-legend" id="elite-legend"></p>
+    <div id="elite-chart"></div>
+    <h3 style="margin:1.25rem 0 .5rem;font-size:1rem" id="elite-latest-title"></h3>
+    <div style="overflow-x:auto"><table class="elite-table" id="elite-table"></table></div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-bottom:.5rem;font-size:1.2rem">Session history</h2>
+    <ul class="session-list" id="session-list"></ul>
+  </div>
+</div>
+
+<div class="state" id="empty-state" style="display:none">No sessions logged yet — this will fill in after your first tracked session.</div>
+<div class="state" id="error-state" style="display:none">Couldn't load your data right now. Please check back shortly.</div>
+
+<script>
+// Fill these in after deploying infra/template.yaml.
+const API_BASE = "https://CHANGE-ME.execute-api.eu-west-2.amazonaws.com";
+const CLIENT_ID = "CHANGE-ME-client-id";
+
+const ZONE_COLORS = ["#4a90d9", "#3fbfad", "#8bcf7a", "#f2a93b", "#e5484d"];
+
+function fmtDuration(sec) {
+  const m = Math.round(sec / 60);
+  return `${m} min`;
+}
+function fmtDate(iso) {
+  return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+async function loadSummary() {
+  try {
+    const res = await fetch(`${API_BASE}/clients/${CLIENT_ID}/summary`);
+    if (res.status === 404) {
+      document.getElementById('subtitle').style.display = 'none';
+      document.getElementById('empty-state').style.display = 'block';
+      return;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    render(data);
+  } catch (err) {
+    document.getElementById('subtitle').style.display = 'none';
+    document.getElementById('error-state').style.display = 'block';
+    console.error(err);
+  }
+}
+
+function fmtClock(sec) {
+  if (sec == null) return '--';
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function cell(tag, text) {
+  const el = document.createElement(tag);
+  el.textContent = text;
+  return el;
+}
+
+function renderElite(data) {
+  const sessions = (data.elite_sessions || []).filter(s => s.total_s != null);
+  if (!sessions.length) return;                       // no elite sessions: the card stays hidden
+  const latest = sessions[sessions.length - 1];
+  const target = latest.target_total_s;
+  const scale = Math.max(...sessions.map(s => s.total_s), target || 0) * 1.05;
+
+  document.getElementById('elite-legend').textContent =
+    (target ? `Total time per session. The amber line is the real fight length including rests (${fmtClock(target)}). ` : 'Total time per session. ')
+    + 'A grey bar marked * is a session that was stopped early.';
+
+  const chart = document.getElementById('elite-chart');
+  sessions.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'elite-row';
+    const track = document.createElement('div');
+    track.className = 'elite-track';
+    const bar = document.createElement('i');
+    bar.style.width = `${(s.total_s / scale) * 100}%`;
+    if (!s.completed) bar.className = 'partial';
+    track.appendChild(bar);
+    if (s.target_total_s) {
+      const marker = document.createElement('span');
+      marker.className = 'elite-target';
+      marker.style.left = `${(s.target_total_s / scale) * 100}%`;
+      track.appendChild(marker);
+    }
+    const total = cell('b', fmtClock(s.total_s) + (s.completed ? '' : '*'));
+    row.append(cell('span', fmtDate(s.started_at)), track, total);
+    chart.appendChild(row);
+  });
+
+  document.getElementById('elite-latest-title').textContent = `Latest session by round (${fmtDate(latest.started_at)})`;
+  const table = document.getElementById('elite-table');
+  const head = document.createElement('tr');
+  ['Round', 'Pre-work', 'Paused', 'Recovery', 'HR drop 60s'].forEach(h => head.appendChild(cell('th', h)));
+  table.appendChild(head);
+  latest.rounds.forEach(r => {
+    const tr = document.createElement('tr');
+    const note = (r.flags && r.flags.length) ? ` (${r.flags.join(', ')})` : '';
+    tr.append(
+      cell('td', `${r.round_no}${note}`),
+      cell('td', fmtClock(r.prework_s)),
+      cell('td', fmtClock(r.paused_s)),
+      cell('td', fmtClock(r.recovery_s)),
+      cell('td', r.hr_drop_60 == null ? '--' : `${r.hr_drop_60} bpm`),
+    );
+    table.appendChild(tr);
+  });
+  document.getElementById('elite-card').style.display = 'block';
+}
+
+function render(data) {
+  document.getElementById('subtitle').textContent = `${data.session_count} session${data.session_count === 1 ? '' : 's'} tracked so far.`;
+  document.getElementById('stat-sessions').textContent = data.session_count;
+  document.getElementById('stat-duration').textContent = fmtDuration(data.avg_duration_sec);
+  const avgHr = Math.round(data.sessions.reduce((a, s) => a + (s.avg_hr || 0), 0) / data.sessions.length);
+  document.getElementById('stat-avghr').textContent = `${avgHr} bpm`;
+  document.getElementById('stat-last').textContent = fmtDate(data.last_session_at);
+
+  const zoneBars = document.getElementById('zone-bars');
+  data.sessions[0].zone_names.forEach((name, i) => {
+    const pct = data.avg_zone_pct[i];
+    const row = document.createElement('div');
+    row.className = 'zone-row';
+    row.innerHTML = `<span>${name}</span><div class="zone-track"><i style="width:${pct}%;background:${ZONE_COLORS[i]}"></i></div><b>${pct}%</b>`;
+    zoneBars.appendChild(row);
+  });
+
+  const list = document.getElementById('session-list');
+  [...data.sessions].reverse().forEach(s => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="date">${fmtDate(s.started_at)}</span><span>${fmtDuration(s.duration_sec)} · avg ${s.avg_hr} bpm</span>`;
+    list.appendChild(li);
+  });
+
+  renderElite(data);
+  document.getElementById('content').style.display = 'block';
+}
+
+loadSummary();
+</script>
+</body>
+</html>

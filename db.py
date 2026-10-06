@@ -4,6 +4,7 @@ Designed to be a drop-in local store now, and an easy upload source to S3
 later (each finished session can be exported as one JSON/CSV blob keyed by
 session_id for the bronze layer).
 """
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -33,7 +34,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     started_at TEXT NOT NULL,
     ended_at TEXT,
     strap_device_id TEXT,
-    notes TEXT
+    notes TEXT,
+    mode TEXT NOT NULL DEFAULT 'normal',   -- 'normal' | 'elite'
+    mode_params TEXT                       -- JSON: elite settings plus each client's frozen zone 5 / recovered levels
 );
 
 CREATE TABLE IF NOT EXISTS client_device_bindings (
@@ -53,6 +56,31 @@ CREATE TABLE IF NOT EXISTS hr_samples (
     ts TEXT NOT NULL,          -- ISO timestamp, UTC
     hr INTEGER NOT NULL,
     rr_intervals TEXT          -- JSON-encoded list of ms floats, nullable
+);
+
+CREATE TABLE IF NOT EXISTS elite_rounds (
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    client_id TEXT NOT NULL REFERENCES clients(id),
+    round_no INTEGER NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    prework_s REAL,
+    work_s REAL,
+    paused_s REAL,
+    recovery_s REAL,
+    hr_end_work INTEGER,
+    hr_60s INTEGER,
+    flags TEXT,                -- JSON list, e.g. ["pause_cap"]
+    PRIMARY KEY (session_id, client_id, round_no)
+);
+
+CREATE TABLE IF NOT EXISTS session_phase_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    client_id TEXT NOT NULL REFERENCES clients(id),
+    round_no INTEGER NOT NULL,
+    phase TEXT NOT NULL,       -- prework | work | recovery | done
+    ts TEXT NOT NULL           -- ISO timestamp, UTC
 );
 
 CREATE TABLE IF NOT EXISTS session_participants (
@@ -91,6 +119,11 @@ def init_db() -> None:
             conn.execute("ALTER TABLE hr_samples ADD COLUMN client_id TEXT REFERENCES clients(id)")
         if "strap_device_id" not in sample_columns:
             conn.execute("ALTER TABLE hr_samples ADD COLUMN strap_device_id TEXT")
+        session_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if "mode" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal'")
+        if "mode_params" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN mode_params TEXT")
         conn.execute(
             """INSERT OR IGNORE INTO session_participants (session_id, client_id, strap_device_id)
                SELECT id, client_id, strap_device_id FROM sessions
@@ -166,12 +199,15 @@ def client_age(dob_iso: str | None) -> int | None:
 
 # ---------- sessions ----------
 
-def start_session(client_id: str, strap_device_id: str | None = None) -> str:
+def start_session(client_id: str, strap_device_id: str | None = None,
+                  mode: str = "normal", mode_params: dict | None = None) -> str:
     session_id = str(uuid.uuid4())
     with get_conn() as conn:
         conn.execute(
-            "INSERT INTO sessions (id, client_id, started_at, strap_device_id) VALUES (?, ?, ?, ?)",
-            (session_id, client_id, datetime.utcnow().isoformat(), strap_device_id),
+            """INSERT INTO sessions (id, client_id, started_at, strap_device_id, mode, mode_params)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, client_id, datetime.utcnow().isoformat(), strap_device_id,
+             mode, json.dumps(mode_params) if mode_params is not None else None),
         )
     return session_id
 
@@ -286,4 +322,62 @@ def session_samples(session_id: str) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM hr_samples WHERE session_id = ? ORDER BY ts", (session_id,)
+        ).fetchall()
+
+
+# ---------- elite mode ----------
+
+def session_mode_params(session) -> dict:
+    """A session's mode settings as a dict (empty for normal sessions)."""
+    raw = session["mode_params"] if session is not None else None
+    return json.loads(raw) if raw else {}
+
+
+def save_phase_event(session_id: str, client_id: str, round_no: int, phase: str, ts_iso: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO session_phase_events (session_id, client_id, round_no, phase, ts)
+               VALUES (?, ?, ?, ?, ?)""",
+            (session_id, client_id, round_no, phase, ts_iso),
+        )
+
+
+def save_elite_round(session_id: str, client_id: str, round_no: int, started_at: str | None,
+                     ended_at: str | None, prework_s: float, work_s: float, paused_s: float,
+                     recovery_s: float | None, hr_end_work: int | None, hr_60s: int | None,
+                     flags: list[str]) -> None:
+    """Inserts or updates one round. A round is saved when work ends and updated when recovery ends."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO elite_rounds
+               (session_id, client_id, round_no, started_at, ended_at, prework_s, work_s,
+                paused_s, recovery_s, hr_end_work, hr_60s, flags)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, client_id, round_no, started_at, ended_at, prework_s, work_s,
+             paused_s, recovery_s, hr_end_work, hr_60s, json.dumps(flags)),
+        )
+
+
+def list_elite_rounds(session_id: str, client_id: str | None = None) -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        if client_id:
+            return conn.execute(
+                "SELECT * FROM elite_rounds WHERE session_id = ? AND client_id = ? ORDER BY round_no",
+                (session_id, client_id),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM elite_rounds WHERE session_id = ? ORDER BY client_id, round_no",
+            (session_id,),
+        ).fetchall()
+
+
+def list_phase_events(session_id: str, client_id: str | None = None) -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        if client_id:
+            return conn.execute(
+                "SELECT * FROM session_phase_events WHERE session_id = ? AND client_id = ? ORDER BY id",
+                (session_id, client_id),
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM session_phase_events WHERE session_id = ? ORDER BY id", (session_id,)
         ).fetchall()
