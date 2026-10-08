@@ -9,6 +9,7 @@ from main import (
     can_start_session,
     chart_fill_fraction,
     chart_marker_fraction,
+    configure_ssl_environment,
     estimate_calories,
 )
 from zones import zone_for_hr
@@ -43,6 +44,12 @@ class SessionLogicTests(unittest.TestCase):
         self.assertGreater(estimate, 0)
         self.assertIsNone(estimate_calories("other", 30, 65, 140, 1800))
         self.assertIsNone(estimate_calories("male", 30, None, 140, 1800))
+
+    def test_configure_ssl_environment_sets_certifi_bundle_when_missing(self):
+        with patch.dict("os.environ", {}, clear=True):
+            configure_ssl_environment()
+            self.assertTrue("SSL_CERT_FILE" in __import__("os").environ)
+            self.assertTrue(__import__("os").environ["SSL_CERT_FILE"].endswith("cacert.pem"))
 
     def test_session_records_multiple_participants_and_sample_owners(self):
         with TemporaryDirectory() as temp_dir, patch.object(db, "DB_PATH", Path(temp_dir) / "test.db"):
