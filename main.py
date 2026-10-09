@@ -6,8 +6,40 @@ Bluetooth permission granted to the terminal/IDE running this (macOS will
 prompt on first connect).
 """
 import asyncio
+import os
 import time
 from datetime import datetime, timedelta
+
+try:
+    import certifi
+except ImportError:  # pragma: no cover - dependency is normally installed with the app
+    certifi = None
+
+
+def configure_ssl_environment():
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return os.environ.get("SSL_CERT_FILE")
+
+    candidate_paths = []
+    if certifi is not None:
+        candidate_paths.append(certifi.where())
+    candidate_paths.extend(
+        [
+            "/etc/ssl/cert.pem",
+            "/System/Library/OpenSSL/cert.pem",
+            "/Library/Frameworks/Python.framework/Versions/3.13/etc/openssl/cert.pem",
+        ]
+    )
+
+    for cert_path in candidate_paths:
+        if cert_path and os.path.exists(cert_path):
+            os.environ["SSL_CERT_FILE"] = cert_path
+            return cert_path
+
+    return None
+
+
+configure_ssl_environment()
 
 import flet as ft
 
