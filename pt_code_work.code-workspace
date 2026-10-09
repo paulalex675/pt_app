@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../pt_website"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../pt_invoicing_app"
+		}
+	],
+	"settings": {}
+}
