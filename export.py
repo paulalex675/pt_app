@@ -21,7 +21,7 @@ from datetime import date, datetime, timezone
 
 import db
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # 2 adds mode and the optional elite block; version 1 records stay valid
 DEFAULT_REGION = "eu-west-2"  # London — keep client health data in the UK
 
 
@@ -49,6 +49,9 @@ def build_client_exports(session_id: str) -> list[dict]:
         (p["client_id"], p["strap_device_id"]) for p in db.list_session_participants(session_id)
     ] or [(session["client_id"], session["strap_device_id"])]
 
+    mode = session["mode"] if "mode" in session.keys() else "normal"
+    mode_params = db.session_mode_params(session)
+
     exports = []
     for client_id, strap_id in participants:
         client = db.get_client(client_id)
@@ -57,10 +60,11 @@ def build_client_exports(session_id: str) -> list[dict]:
             if s["client_id"] == client_id
             or (s["client_id"] is None and client_id == session["client_id"])  # legacy rows
         ]
-        exports.append({
+        record = {
             "schema_version": SCHEMA_VERSION,
             "session_id": session_id,
             "client_id": client_id,
+            "mode": mode,
             "strap_device_id": strap_id,
             "started_at": session["started_at"],
             "ended_at": session["ended_at"],
@@ -81,8 +85,45 @@ def build_client_exports(session_id: str) -> list[dict]:
                 for s in own
             ],
             "exported_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if mode == "elite":
+            record["elite"] = _elite_block(session_id, client_id, mode_params)
+        exports.append(record)
     return exports
+
+
+def _elite_block(session_id: str, client_id: str, mode_params: dict) -> dict:
+    """This client's elite data only.
+
+    The session settings hold every participant's thresholds, so the shared
+    parts are copied out and only this client's own frozen levels are kept.
+    A bronze record must never carry another client's data.
+    """
+    shared = {k: v for k, v in mode_params.items() if k != "clients"}
+    own = (mode_params.get("clients") or {}).get(client_id)
+    return {
+        "params": shared,
+        "frozen": own,
+        "rounds": [
+            {
+                "round_no": r["round_no"],
+                "started_at": r["started_at"],
+                "ended_at": r["ended_at"],
+                "prework_s": r["prework_s"],
+                "work_s": r["work_s"],
+                "paused_s": r["paused_s"],
+                "recovery_s": r["recovery_s"],
+                "hr_end_work": r["hr_end_work"],
+                "hr_60s": r["hr_60s"],
+                "flags": json.loads(r["flags"] or "[]"),
+            }
+            for r in db.list_elite_rounds(session_id, client_id)
+        ],
+        "events": [
+            {"ts": e["ts"], "round_no": e["round_no"], "phase": e["phase"]}
+            for e in db.list_phase_events(session_id, client_id)
+        ],
+    }
 
 
 def bronze_key(client_id: str, session_id: str) -> str:

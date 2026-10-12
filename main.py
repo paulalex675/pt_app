@@ -6,40 +6,9 @@ Bluetooth permission granted to the terminal/IDE running this (macOS will
 prompt on first connect).
 """
 import asyncio
-import os
+import json
 import time
 from datetime import datetime, timedelta
-
-try:
-    import certifi
-except ImportError:  # pragma: no cover - dependency is normally installed with the app
-    certifi = None
-
-
-def configure_ssl_environment():
-    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
-        return os.environ.get("SSL_CERT_FILE")
-
-    candidate_paths = []
-    if certifi is not None:
-        candidate_paths.append(certifi.where())
-    candidate_paths.extend(
-        [
-            "/etc/ssl/cert.pem",
-            "/System/Library/OpenSSL/cert.pem",
-            "/Library/Frameworks/Python.framework/Versions/3.13/etc/openssl/cert.pem",
-        ]
-    )
-
-    for cert_path in candidate_paths:
-        if cert_path and os.path.exists(cert_path):
-            os.environ["SSL_CERT_FILE"] = cert_path
-            return cert_path
-
-    return None
-
-
-configure_ssl_environment()
 
 import flet as ft
 
@@ -128,26 +97,22 @@ def main(page: ft.Page):
         "session_id": None,
         "last_session_id": None,
         "session_start": None,
-        "session_wall_start": None,
         "client_device_bindings": {},
         "available_devices": [],
+        "mode": elite.MODE_NORMAL,
+        "elite": None,              # settings of the running/last elite session
+        "session_start_wall": None,
     }
 
     def refresh_session_controls():
         has_active_session = bool(state["session_id"])
         start_btn.disabled = not (state["participants"] and not has_active_session)
         stop_btn.disabled = not has_active_session
-        mode_picker.disabled = has_active_session
-        elite_fields_disabled = has_active_session or mode_picker.value != elite.MODE_ELITE
-        for field in (
-            elite_rounds_field,
-            elite_round_length_field,
-            elite_recovered_field,
-            elite_rest_field,
-        ):
-            field.disabled = elite_fields_disabled
         client_picker.disabled = False
         device_picker.disabled = False
+        for control in (mode_picker, elite_rounds_field, elite_round_field,
+                        elite_recovered_field, elite_rest_field):
+            control.disabled = has_active_session
         attached_client_ids = set(state["participants"])
         attached_device_addresses = {
             participant["device_address"] for participant in state["participants"].values()
@@ -312,31 +277,10 @@ def main(page: ft.Page):
     elapsed_text = ft.Text("00:00", size=16, color=ft.Colors.GREY_400)
     start_btn = ft.FilledButton("Start session", icon=ft.Icons.PLAY_ARROW, disabled=True)
     stop_btn = ft.FilledButton("End session", icon=ft.Icons.STOP, disabled=True, bgcolor=ft.Colors.RED_700)
-    mode_picker = ft.Dropdown(
-        label="Mode",
-        width=220,
-        value=elite.MODE_NORMAL,
-        options=[
-            ft.dropdown.Option(key=elite.MODE_NORMAL, text="Normal"),
-            ft.dropdown.Option(key=elite.MODE_ELITE, text="Elite"),
-        ],
-    )
-    elite_rounds_field = ft.TextField(label="Rounds", value="5", width=120)
-    elite_round_length_field = ft.TextField(label="Round length (m:ss)", value="3:00", width=180)
-    elite_recovered_field = ft.TextField(
-        label="Recovered at (% of HR reserve)", value="70", width=250
-    )
-    elite_rest_field = ft.TextField(label="Fight rest (m:ss)", value="1:00", width=180)
-    elite_settings = ft.Row(
-        [elite_rounds_field, elite_round_length_field, elite_recovered_field, elite_rest_field],
-        wrap=True,
-        visible=False,
-    )
-    elite_status = ft.Column(spacing=4)
     summary_session_title = ft.Text("No completed session", size=20, weight=ft.FontWeight.BOLD)
     summary_session_times = ft.Text("Start: --    End: --    Duration: --", color=ft.Colors.GREY_400)
     summary_participant_rows = ft.Column(spacing=4)
-    summary_elite_details = ft.Column(spacing=4)
+    summary_elite_rows = ft.Column(spacing=2)
     summary_empty_message = ft.Text("End a session to view its summary.", color=ft.Colors.GREY_400)
     resting_hr_fields = {}
     resting_hr_dialog_content = ft.Column(spacing=8, tight=True, scroll=ft.ScrollMode.AUTO, height=360)
@@ -349,6 +293,40 @@ def main(page: ft.Page):
 
     start_session_error = ft.Text(color=ft.Colors.RED_300, visible=False)
     empty_chart_message = ft.Text("No participants added", color=ft.Colors.GREY_400)
+
+    # ---- session mode: normal or elite ----
+    mode_picker = ft.Dropdown(
+        label="Mode", width=180, value=elite.MODE_NORMAL,
+        options=[
+            ft.dropdown.Option(key=elite.MODE_NORMAL, text="Normal"),
+            ft.dropdown.Option(key=elite.MODE_ELITE, text="Elite"),
+        ],
+    )
+    elite_rounds_field = ft.TextField(label="Rounds", value="3", width=90, keyboard_type=ft.KeyboardType.NUMBER)
+    elite_round_field = ft.TextField(label="Round length (m:ss)", value="3:00", width=160)
+    elite_recovered_field = ft.TextField(
+        label="Recovered at (% of HR reserve)", value="70", width=230, keyboard_type=ft.KeyboardType.NUMBER
+    )
+    elite_rest_field = ft.TextField(label="Fight rest (m:ss)", value="1:00", width=140)
+    elite_settings_row = ft.Row(
+        [elite_rounds_field, elite_round_field, elite_recovered_field, elite_rest_field],
+        spacing=12, wrap=True, visible=False,
+    )
+    elite_hint = ft.Text(
+        "Elite: work until zone 5 (red line) -> the round clock runs only while in zone 5 -> "
+        "rest until the recovered level (teal line). Total time is compared with the real fight length "
+        "(rounds + fight rests). Add everyone before starting.",
+        size=11, color=ft.Colors.GREY_400, visible=False,
+    )
+
+    def on_mode_pick(e):
+        state["mode"] = mode_picker.value or elite.MODE_NORMAL
+        is_elite = state["mode"] == elite.MODE_ELITE
+        elite_settings_row.visible = is_elite
+        elite_hint.visible = is_elite
+        page.update()
+
+    mode_picker.on_select = on_mode_pick
 
     def make_participant_row(client_id, device):
         client = db.get_client(client_id)
@@ -379,6 +357,8 @@ def main(page: ft.Page):
             height=34,
         )
         row = ft.Row([name_control, bar, hr_control], spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        phase_control = ft.Text("", size=13, weight=ft.FontWeight.BOLD, visible=False)
+        row_with_phase = ft.Column([row, phase_control], spacing=2)
         return {
             "client_id": client_id,
             "device_address": device["address"],
@@ -388,12 +368,13 @@ def main(page: ft.Page):
             "thresholds": load_client_thresholds(client_id),
             "last_sample_time": None,
             "max_streak": {},
-            "elite_engine": None,
-            "elite_saved_rounds": 0,
             "bar_fill": bar_fill,
             "value_control": value_control,
             "hr_control": hr_control,
-            "row": row,
+            "row": row_with_phase,
+            "phase_control": phase_control,
+            "bar_stack": bar,
+            "engine": None,
             "stream": None,
         }
 
@@ -401,6 +382,64 @@ def main(page: ft.Page):
         participant_chart.controls = [participant["row"] for participant in state["participants"].values()]
         participant_chart.visible = bool(state["participants"])
         empty_chart_message.visible = not state["participants"]
+
+    def wall_iso(t_mono):
+        """Converts a monotonic timestamp to a UTC ISO time anchored to the session's start."""
+        start = state["session_start_wall"]
+        if start is None:
+            return datetime.utcnow().isoformat()
+        return (start + timedelta(seconds=t_mono - state["session_start"])).isoformat()
+
+    def persist_elite(client_id, participant, events):
+        """After any phase change, store the events and the latest state of every round."""
+        if not events or not state["session_id"]:
+            return
+        for event in events:
+            db.save_phase_event(state["session_id"], client_id, event.round_no, event.phase, wall_iso(event.t))
+        for r in participant["engine"].results:
+            db.save_elite_round(
+                state["session_id"], client_id, r.round_no,
+                wall_iso(r.started_t), wall_iso(r.ended_t) if r.ended_t is not None else None,
+                round(r.prework_s, 1), round(r.work_s, 1), round(r.paused_s, 1),
+                None if r.recovery_s is None else round(r.recovery_s, 1),
+                r.hr_end_work, r.hr_60s, r.flags,
+            )
+
+    def render_elite_status(participant):
+        engine = participant["engine"]
+        snap = engine.snapshot(time.monotonic())
+        params = engine.p
+        control = participant["phase_control"]
+        label = f"Round {snap['round_no']}/{snap['rounds']}"
+        if snap["phase"] == elite.PREWORK:
+            control.value = f"PRE-WORK  {label}  get above {params.z5_low:.0f} bpm"
+            control.color = zones.ZONE_COLORS[3]
+        elif snap["phase"] == elite.WORK:
+            left = elite.format_clock(snap["work_remaining_s"])
+            if snap["running"]:
+                control.value = f"WORK  {label}  {left} left"
+                control.color = zones.ZONE_COLORS[4]
+            else:
+                control.value = f"PAUSED  {label}  {left} left  get back above {params.z5_low:.0f} bpm"
+                control.color = zones.ZONE_COLORS[3]
+        elif snap["phase"] == elite.RECOVERY:
+            control.value = f"RECOVERY  {label}  rest to {params.recovered_bpm:.0f} bpm or below"
+            control.color = zones.ZONE_COLORS[1]
+        else:
+            target = (state["elite"] or {}).get("target_total_s")
+            control.value = (
+                f"DONE  total {elite.format_clock(snap['total_elapsed_s'])}"
+                f"  vs fight {elite.format_clock(target)}"
+            )
+            control.color = zones.ZONE_COLORS[2]
+        control.visible = True
+
+    def handle_elite_sample(client_id, participant, hr, now):
+        events = participant["engine"].update(now, hr)
+        persist_elite(client_id, participant, events)
+        render_elite_status(participant)
+        if events and all(p["engine"].done for p in state["participants"].values() if p.get("engine")):
+            elapsed_text.value = "All rounds complete. Press End session to save."
 
     def apply_participant_sample(client_id, hr: int, rr_intervals: list[float]):
         participant = state["participants"].get(client_id)
@@ -426,83 +465,13 @@ def main(page: ft.Page):
                 state["session_id"], hr, rr_to_json(rr_intervals),
                 client_id=client_id, strap_device_id=participant["device_address"],
             )
-            engine = participant["elite_engine"]
-            if engine is not None:
-                events = engine.update(now, hr)
-                _record_elite_updates(participant, events)
             participant["last_sample_time"] = now
             started = state["session_start"]
             secs = int(now - started) if started else 0
             elapsed_text.value = f"{secs // 60:02d}:{secs % 60:02d}"
-            _refresh_elite_status()
+            if participant.get("engine"):
+                handle_elite_sample(client_id, participant, hr, now)
         page.update()
-
-    def _elite_timestamp(monotonic_time):
-        offset = monotonic_time - state["session_start"]
-        return (state["session_wall_start"] + timedelta(seconds=offset)).isoformat()
-
-    def _record_elite_updates(participant, events):
-        session_id = state["session_id"]
-        if not session_id:
-            return
-        client_id = participant["client_id"]
-        engine = participant["elite_engine"]
-        for event in events:
-            db.save_phase_event(
-                session_id, client_id, event.round_no, event.phase, _elite_timestamp(event.t)
-            )
-        while participant["elite_saved_rounds"] < len(engine.results):
-            result = engine.results[participant["elite_saved_rounds"]]
-            db.save_elite_round(
-                session_id,
-                client_id,
-                result.round_no,
-                _elite_timestamp(result.started_t),
-                _elite_timestamp(result.ended_t) if result.ended_t is not None else None,
-                result.prework_s,
-                result.work_s,
-                result.paused_s,
-                result.recovery_s,
-                result.hr_end_work,
-                result.hr_60s,
-                result.flags,
-            )
-            participant["elite_saved_rounds"] += 1
-        if engine.results:
-            result = engine.results[-1]
-            db.save_elite_round(
-                session_id,
-                client_id,
-                result.round_no,
-                _elite_timestamp(result.started_t),
-                _elite_timestamp(result.ended_t) if result.ended_t is not None else None,
-                result.prework_s,
-                result.work_s,
-                result.paused_s,
-                result.recovery_s,
-                result.hr_end_work,
-                result.hr_60s,
-                result.flags,
-            )
-
-    def _refresh_elite_status():
-        elite_status.controls.clear()
-        if not state["session_id"] or mode_picker.value != elite.MODE_ELITE:
-            return
-        for participant in state["participants"].values():
-            engine = participant["elite_engine"]
-            if engine is None:
-                continue
-            snapshot = engine.snapshot(time.monotonic())
-            if engine.done:
-                text = f"DONE — {participant['name']}"
-            else:
-                phase = snapshot["phase"].replace("prework", "pre-work")
-                text = (
-                    f"{participant['name']}: Round {snapshot['round_no']}/{snapshot['rounds']} "
-                    f"{phase} — {elite.format_clock(snapshot['work_remaining_s'])} work remaining"
-                )
-            elite_status.controls.append(ft.Text(text, color=ft.Colors.GREY_300))
 
     def on_hr_sample(client_id, hr: int, rr_intervals: list[float]):
         apply_participant_sample(client_id, hr, rr_intervals)
@@ -527,6 +496,10 @@ def main(page: ft.Page):
         page.update()
 
     async def attach_selected_device(e):
+        if state["session_id"] and state["mode"] == elite.MODE_ELITE:
+            strap_status.value = "Add everyone before starting an elite session."
+            page.update()
+            return
         if not state["selected_client_id"]:
             strap_status.value = "Choose a client before attaching a strap."
             page.update()
@@ -591,78 +564,103 @@ def main(page: ft.Page):
 
     device_picker.on_select = on_device_pick
 
-    def on_mode_pick(e):
-        elite_settings.visible = e.control.value == elite.MODE_ELITE
-        refresh_session_controls()
-        page.update()
-
-    mode_picker.on_select = on_mode_pick
-
     def start_session(e):
         if not state["participants"]:
             start_session_error.value = "Add at least one client and device before starting."
             start_session_error.visible = True
             page.update()
             return
+        mode = state["mode"]
         settings = None
-        mode_params = None
-        if mode_picker.value == elite.MODE_ELITE:
+        if mode == elite.MODE_ELITE:
             settings, error = elite.parse_settings(
-                elite_rounds_field.value,
-                elite_round_length_field.value,
-                elite_recovered_field.value,
-                elite_rest_field.value,
+                elite_rounds_field.value, elite_round_field.value,
+                elite_recovered_field.value, elite_rest_field.value,
             )
             if error:
                 start_session_error.value = error
                 start_session_error.visible = True
                 page.update()
                 return
-            mode_params = dict(settings)
-            mode_params["clients"] = {}
+        now = time.monotonic()
+        mode_params = None
+        if settings:
+            # Zone 5 and "recovered" are frozen for the whole session, so the numbers cannot move mid-session.
+            frozen = {}
             for participant in state["participants"].values():
                 client = db.get_client(participant["client_id"])
-                thresholds = participant["thresholds"]
-                mode_params["clients"][participant["client_id"]] = {
-                    "z5_low": thresholds[4],
-                    "recovered_bpm": elite.recovered_bpm(
-                        thresholds, client["resting_hr"], settings["recovered_pct"]
-                    ),
+                thresholds = list(participant["thresholds"])
+                params = elite.params_for_client(thresholds, client["resting_hr"], settings)
+                participant["engine"] = elite.EliteEngine(params, now)
+                frozen[participant["client_id"]] = {
+                    "z5_low": params.z5_low,
+                    "recovered_bpm": round(params.recovered_bpm, 1),
                     "max_hr": thresholds[-1],
                     "resting_hr": client["resting_hr"],
                 }
+            mode_params = {**settings, "clients": frozen}
         first_participant = next(iter(state["participants"].values()))
         state["session_id"] = db.start_session(
-            first_participant["client_id"],
-            first_participant["device_address"],
-            mode=mode_picker.value or elite.MODE_NORMAL,
-            mode_params=mode_params,
+            first_participant["client_id"], first_participant["device_address"],
+            mode=mode, mode_params=mode_params,
         )
-        state["session_start"] = time.monotonic()
-        session = db.get_session(state["session_id"])
-        state["session_wall_start"] = datetime.fromisoformat(session["started_at"])
+        state["session_start_wall"] = datetime.fromisoformat(
+            db.get_session(state["session_id"])["started_at"]
+        )
         for participant in state["participants"].values():
             db.add_session_participant(
                 state["session_id"], participant["client_id"], participant["device_address"]
             )
-            if settings is not None:
-                client = db.get_client(participant["client_id"])
-                params = elite.params_for_client(
-                    participant["thresholds"], client["resting_hr"], settings
-                )
-                engine = elite.EliteEngine(params, state["session_start"])
-                participant["elite_engine"] = engine
-                participant["elite_saved_rounds"] = 0
-                _record_elite_updates(participant, engine.pop_events())
+        state["session_start"] = now
+        state["elite"] = settings
+        for participant in state["participants"].values():
+            if participant.get("engine"):
+                engine = participant["engine"]
+                for bpm, colour in ((engine.p.z5_low, zones.ZONE_COLORS[4]), (engine.p.recovered_bpm, zones.ZONE_COLORS[1])):
+                    participant["bar_stack"].controls.append(ft.Container(
+                        left=CHART_WIDTH * chart_fill_fraction(int(bpm), participant["max_hr"]),
+                        top=0, width=2, height=34, bgcolor=colour,
+                    ))
+                persist_elite(participant["client_id"], participant, engine.pop_events() or [])
+                render_elite_status(participant)
         start_session_error.visible = False
-        _refresh_elite_status()
         refresh_session_controls()
         page.update()
+
+    def populate_elite_summary(session, session_id):
+        params = db.session_mode_params(session)
+        target = params.get("target_total_s")
+        summary_elite_rows.controls.append(ft.Divider())
+        summary_elite_rows.controls.append(ft.Text(
+            f"Elite session: {params.get('rounds')} x {elite.format_clock(params.get('round_s'))} rounds, "
+            f"fight length {elite.format_clock(target)} (rests {elite.format_clock(params.get('target_rest_s'))})",
+            weight=ft.FontWeight.BOLD,
+        ))
+        for member in db.list_session_participants(session_id):
+            client = db.get_client(member["client_id"])
+            events = [dict(ev) for ev in db.list_phase_events(session_id, member["client_id"])]
+            total = elite.total_seconds_from_events(events)
+            summary_elite_rows.controls.append(ft.Text(
+                f"{client['first_name']} {client['last_name']}: total {elite.format_clock(total)} "
+                f"(fight {elite.format_clock(target)})",
+                weight=ft.FontWeight.BOLD, size=14,
+            ))
+            for r in db.list_elite_rounds(session_id, member["client_id"]):
+                flags = json.loads(r["flags"] or "[]")
+                drop = (r["hr_end_work"] - r["hr_60s"]) if r["hr_end_work"] is not None and r["hr_60s"] is not None else None
+                summary_elite_rows.controls.append(ft.Text(
+                    f"R{r['round_no']}  pre-work {elite.format_clock(r['prework_s'])}  "
+                    f"work {elite.format_clock(r['work_s'])}  paused {elite.format_clock(r['paused_s'])}  "
+                    f"recovery {elite.format_clock(r['recovery_s'])}  "
+                    f"HR drop at 60s {'--' if drop is None else str(drop) + ' bpm'}"
+                    f"{'  [' + ', '.join(flags) + ']' if flags else ''}",
+                    size=12, color=ft.Colors.GREY_300,
+                ))
 
     def refresh_summary_screen(session_id):
         session, participant_summaries = db.session_summary(session_id)
         summary_participant_rows.controls.clear()
-        summary_elite_details.controls.clear()
+        summary_elite_rows.controls.clear()
         if not session:
             summary_session_title.value = "No completed session"
             summary_session_times.value = "Start: --    End: --    Duration: --"
@@ -679,24 +677,6 @@ def main(page: ft.Page):
             f"Duration: {format_session_duration(duration_seconds)}"
         )
         summary_empty_message.visible = not participant_summaries
-        if session["mode"] == elite.MODE_ELITE:
-            params = db.session_mode_params(session)
-            summary_elite_details.controls.append(
-                ft.Text(
-                    f"Elite session: {params['rounds']} x {elite.format_clock(params['round_s'])} "
-                    f"rounds; target rest {elite.format_clock(params['target_rest_s'])}"
-                )
-            )
-            for participant in db.list_session_participants(session_id):
-                for result in db.list_elite_rounds(session_id, participant["client_id"]):
-                    summary_elite_details.controls.append(
-                        ft.Text(
-                            f"R{result['round_no']}  pre-work "
-                            f"{elite.format_clock(result['prework_s'])} | work "
-                            f"{elite.format_clock(result['work_s'])} | recovery "
-                            f"{elite.format_clock(result['recovery_s'])}"
-                        )
-                    )
         for participant in participant_summaries:
             age = db.client_age(participant["dob"])
             calories = estimate_calories(
@@ -715,6 +695,8 @@ def main(page: ft.Page):
                 )
             )
         summary_empty_message.value = "No participant heart-rate samples were recorded." if participant_summaries else "No participant data recorded."
+        if session["mode"] == elite.MODE_ELITE:
+            populate_elite_summary(session, session_id)
 
     def finish_resting_hr_entry(e=None):
         page.pop_dialog()
@@ -783,13 +765,12 @@ def main(page: ft.Page):
     async def stop_session(e):
         completed_client_ids = list(state["participants"])
         if state["session_id"]:
-            if mode_picker.value == elite.MODE_ELITE:
-                stop_time = time.monotonic()
-                for participant in state["participants"].values():
-                    engine = participant["elite_engine"]
-                    if engine is not None:
-                        _record_elite_updates(participant, engine.finish(stop_time))
             completed_session_id = state["session_id"]
+            stop_now = time.monotonic()
+            for cid, participant in state["participants"].items():
+                engine = participant.get("engine")
+                if engine and not engine.done:
+                    persist_elite(cid, participant, engine.finish(stop_now))
             db.end_session(completed_session_id)
             state["last_session_id"] = completed_session_id
             refresh_summary_screen(completed_session_id)
@@ -797,8 +778,6 @@ def main(page: ft.Page):
             export_status.value = ""
         state["session_id"] = None
         state["session_start"] = None
-        state["session_wall_start"] = None
-        elite_status.controls.clear()
         for participant in state["participants"].values():
             stream = participant["stream"]
             if stream:
@@ -821,13 +800,15 @@ def main(page: ft.Page):
 
     session_tab = ft.Column(
         [
+            ft.Row([mode_picker]),
+            elite_settings_row,
+            elite_hint,
             ft.Text("Add participants", weight=ft.FontWeight.BOLD),
             ft.Row([client_picker, device_picker], alignment=ft.MainAxisAlignment.START),
             ft.Row([scan_btn], alignment=ft.MainAxisAlignment.START),
             ft.Row([attach_btn], alignment=ft.MainAxisAlignment.START),
             ft.Row([strap_status], alignment=ft.MainAxisAlignment.START),
             start_session_error,
-            ft.Row([mode_picker, elite_settings], alignment=ft.MainAxisAlignment.START, wrap=True),
             ft.Divider(),
             ft.Row([ft.Text("Client", width=150), ft.Text("Heart rate vs. max HR"), ft.Text("Heart rate")], spacing=12),
             ft.Stack(
@@ -845,7 +826,6 @@ def main(page: ft.Page):
             empty_chart_message,
             ft.Row([start_btn, stop_btn], alignment=ft.MainAxisAlignment.CENTER, spacing=20),
             elapsed_text,
-            elite_status,
             zone_legend,
         ],
         expand=True,
@@ -880,7 +860,6 @@ def main(page: ft.Page):
         [
             summary_session_title,
             summary_session_times,
-            summary_elite_details,
             ft.Divider(),
             ft.Row(
                 [
@@ -892,6 +871,7 @@ def main(page: ft.Page):
                 spacing=12,
             ),
             summary_participant_rows,
+            summary_elite_rows,
             summary_empty_message,
             ft.Row([export_btn, export_status], spacing=12),
             ft.Text(
