@@ -19,3 +19,4 @@ build/
 .DS_Store
 # SAM build output
 .aws-sam/
+dashboard/*.local.html
