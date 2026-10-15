@@ -19,4 +19,9 @@ build/
 .DS_Store
 # SAM build output
 .aws-sam/
+
+# SAM deploy settings (stack name, bucket suffix) - keep out of the public repo
+infra/samconfig.toml
+
+# local copy of the dashboard with real client ids
 dashboard/*.local.html

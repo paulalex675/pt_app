@@ -7,6 +7,7 @@ prompt on first connect).
 """
 import asyncio
 import json
+import os
 import time
 from datetime import datetime, timedelta
 
@@ -16,6 +17,23 @@ import db
 import elite
 import zones
 from ble_client import HeartRateStream, rr_to_json, scan_for_straps
+
+
+def configure_ssl_environment() -> None:
+    """Point Python's SSL at certifi's CA bundle when nothing else has.
+
+    A python.org install on macOS ships without root certificates, which makes
+    uploads fail with CERTIFICATE_VERIFY_FAILED. setup_env.sh does the same for
+    the shell; this covers launching the app any other way.
+    """
+    if os.environ.get("SSL_CERT_FILE"):
+        return
+    try:
+        import certifi
+    except ImportError:
+        return
+    os.environ["SSL_CERT_FILE"] = certifi.where()
+    os.environ.setdefault("SSL_CERT_DIR", "")
 
 
 def can_start_session(connected: bool, selected_client_id, session_id) -> bool:
@@ -102,7 +120,17 @@ def main(page: ft.Page):
         "mode": elite.MODE_NORMAL,
         "elite": None,              # settings of the running/last elite session
         "session_start_wall": None,
+        "paused": False,
+        "pause_started": None,
+        "paused_total": 0.0,
+        "summary_session_id": None,   # the session shown on the Summary tab
     }
+
+    def clock():
+        """Session time: monotonic time minus everything spent paused (frozen while paused)."""
+        if state["paused"] and state["pause_started"] is not None:
+            return state["pause_started"] - state["paused_total"]
+        return time.monotonic() - state["paused_total"]
 
     def refresh_session_controls():
         has_active_session = bool(state["session_id"])
@@ -276,7 +304,7 @@ def main(page: ft.Page):
     scan_btn = ft.FilledTonalButton("Scan for strap", icon=ft.Icons.BLUETOOTH_SEARCHING)
     elapsed_text = ft.Text("00:00", size=16, color=ft.Colors.GREY_400)
     start_btn = ft.FilledButton("Start session", icon=ft.Icons.PLAY_ARROW, disabled=True)
-    stop_btn = ft.FilledButton("End session", icon=ft.Icons.STOP, disabled=True, bgcolor=ft.Colors.RED_700)
+    stop_btn = ft.FilledButton("Stop", icon=ft.Icons.STOP, disabled=True, bgcolor=ft.Colors.RED_700)
     summary_session_title = ft.Text("No completed session", size=20, weight=ft.FontWeight.BOLD)
     summary_session_times = ft.Text("Start: --    End: --    Duration: --", color=ft.Colors.GREY_400)
     summary_participant_rows = ft.Column(spacing=4)
@@ -346,13 +374,10 @@ def main(page: ft.Page):
             content=marker,
         )
         value_control = ft.Text("", size=11, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD)
+        bar_track = ft.Container(left=0, top=5, width=CHART_WIDTH, height=24, bgcolor="#30343b", border_radius=3)
+        value_holder = ft.Container(left=0, top=7, width=CHART_WIDTH, height=20, content=value_control)
         bar = ft.Stack(
-            controls=[
-                ft.Container(left=0, top=5, width=CHART_WIDTH, height=24, bgcolor="#30343b", border_radius=3),
-                bar_fill,
-                marker_overlay,
-                ft.Container(left=0, top=7, width=CHART_WIDTH, height=20, content=value_control),
-            ],
+            controls=[bar_track, bar_fill, marker_overlay, value_holder],
             width=CHART_WIDTH,
             height=34,
         )
@@ -369,6 +394,13 @@ def main(page: ft.Page):
             "last_sample_time": None,
             "max_streak": {},
             "bar_fill": bar_fill,
+            "bar_track": bar_track,
+            "marker": marker,
+            "marker_overlay": marker_overlay,
+            "value_holder": value_holder,
+            "name_control": name_control,
+            "elite_markers": [],          # (control, bpm) lines drawn on the bar in elite mode
+            "bar_width": CHART_WIDTH,
             "value_control": value_control,
             "hr_control": hr_control,
             "row": row_with_phase,
@@ -377,6 +409,52 @@ def main(page: ft.Page):
             "engine": None,
             "stream": None,
         }
+
+    def size_participant(participant, width, height, big):
+        """Resizes one client's bar row: small for setup, large for the live full-screen view."""
+        track_h = max(10, height - 10)
+        participant["bar_width"] = width
+        participant["bar_track"].width = width
+        participant["bar_track"].height = track_h
+        participant["bar_fill"].height = track_h
+        participant["marker_overlay"].left = width * chart_marker_fraction()
+        participant["marker_overlay"].height = height
+        participant["marker"].controls = [
+            ft.Container(width=2, height=4, bgcolor=ft.Colors.WHITE) for _ in range(max(6, height // 6))
+        ]
+        holder_h = min(40, track_h)
+        participant["value_holder"].width = width
+        participant["value_holder"].height = holder_h
+        participant["value_holder"].top = 5 + (track_h - holder_h) / 2
+        participant["value_control"].size = 20 if big else 11
+        participant["bar_stack"].width = width
+        participant["bar_stack"].height = height
+        for control, bpm in participant["elite_markers"]:
+            control.left = width * chart_fill_fraction(int(bpm), participant["max_hr"])
+            control.height = height
+        participant["name_control"].width = 230 if big else 150
+        participant["name_control"].size = 26 if big else None
+        participant["hr_control"].width = 190 if big else 64
+        participant["hr_control"].size = 44 if big else None
+        participant["phase_control"].size = 20 if big else 13
+
+    def live_dimensions():
+        width = getattr(page, "width", None) or 1280
+        height = getattr(page, "height", None) or 800
+        count = max(1, len(state["participants"]))
+        bar_w = int(max(300, width - 230 - 190 - 2 * 12 - 48))      # name + heart rate columns, gaps, margins
+        room = (height - 110) / count                               # leave space for the button row
+        bar_h = int(max(60, min(240, room - (56 if state["mode"] == elite.MODE_ELITE else 24))))
+        return bar_w, bar_h
+
+    def apply_live_layout():
+        bar_w, bar_h = live_dimensions()
+        for participant in state["participants"].values():
+            size_participant(participant, bar_w, bar_h, big=True)
+
+    def apply_setup_layout():
+        for participant in state["participants"].values():
+            size_participant(participant, CHART_WIDTH, 34, big=False)
 
     def refresh_participant_chart():
         participant_chart.controls = [participant["row"] for participant in state["participants"].values()]
@@ -407,7 +485,7 @@ def main(page: ft.Page):
 
     def render_elite_status(participant):
         engine = participant["engine"]
-        snap = engine.snapshot(time.monotonic())
+        snap = engine.snapshot(clock())
         params = engine.p
         control = participant["phase_control"]
         label = f"Round {snap['round_no']}/{snap['rounds']}"
@@ -445,22 +523,24 @@ def main(page: ft.Page):
         participant = state["participants"].get(client_id)
         if not participant:
             return
-        if state["session_id"]:
+        recording = bool(state["session_id"]) and not state["paused"]
+        if recording:
             confirmed_max = zones.track_new_max(participant["max_streak"], hr, participant["max_hr"])
             if confirmed_max:
                 participant["max_hr"] = db.update_client_max_hr(client_id, confirmed_max) or confirmed_max
                 participant["thresholds"] = load_client_thresholds(client_id)
         zone_index = zones.zone_for_hr(hr, participant["thresholds"])
-        participant["bar_fill"].width = CHART_WIDTH * chart_fill_fraction(hr, participant["max_hr"])
+        bar_w = participant["bar_width"]
+        participant["bar_fill"].width = bar_w * chart_fill_fraction(hr, participant["max_hr"])
         participant["bar_fill"].bgcolor = zones.ZONE_COLORS[zone_index]
         participant["hr_control"].value = f"{hr} bpm"
         percent = hr / participant["max_hr"] * 100 if participant["max_hr"] else 0
         participant["value_control"].value = f"{percent:.0f}%"
         participant["value_control"].text_align = ft.TextAlign.RIGHT
-        participant["value_control"].width = max(42, min(CHART_WIDTH, CHART_WIDTH * chart_fill_fraction(hr, participant["max_hr"])))
+        participant["value_control"].width = max(42, min(bar_w, bar_w * chart_fill_fraction(hr, participant["max_hr"])))
 
-        now = time.monotonic()
-        if state["session_id"]:
+        now = clock()
+        if recording:
             db.log_sample(
                 state["session_id"], hr, rr_to_json(rr_intervals),
                 client_id=client_id, strap_device_id=participant["device_address"],
@@ -564,25 +644,12 @@ def main(page: ft.Page):
 
     device_picker.on_select = on_device_pick
 
-    def start_session(e):
-        if not state["participants"]:
-            start_session_error.value = "Add at least one client and device before starting."
-            start_session_error.visible = True
-            page.update()
-            return
-        mode = state["mode"]
-        settings = None
-        if mode == elite.MODE_ELITE:
-            settings, error = elite.parse_settings(
-                elite_rounds_field.value, elite_round_field.value,
-                elite_recovered_field.value, elite_rest_field.value,
-            )
-            if error:
-                start_session_error.value = error
-                start_session_error.visible = True
-                page.update()
-                return
-        now = time.monotonic()
+    def launch_session(mode, settings):
+        """Creates the session and its engines, then switches to the full-screen live view."""
+        state["paused"] = False
+        state["pause_started"] = None
+        state["paused_total"] = 0.0
+        now = clock()
         mode_params = None
         if settings:
             # Zone 5 and "recovered" are frozen for the whole session, so the numbers cannot move mid-session.
@@ -614,18 +681,101 @@ def main(page: ft.Page):
         state["session_start"] = now
         state["elite"] = settings
         for participant in state["participants"].values():
-            if participant.get("engine"):
-                engine = participant["engine"]
+            for control, _ in participant["elite_markers"]:          # clear lines left by a restarted session
+                if control in participant["bar_stack"].controls:
+                    participant["bar_stack"].controls.remove(control)
+            participant["elite_markers"] = []
+            engine = participant.get("engine")
+            if engine:
                 for bpm, colour in ((engine.p.z5_low, zones.ZONE_COLORS[4]), (engine.p.recovered_bpm, zones.ZONE_COLORS[1])):
-                    participant["bar_stack"].controls.append(ft.Container(
-                        left=CHART_WIDTH * chart_fill_fraction(int(bpm), participant["max_hr"]),
-                        top=0, width=2, height=34, bgcolor=colour,
-                    ))
+                    line = ft.Container(top=0, width=2, height=34, bgcolor=colour)
+                    participant["bar_stack"].controls.append(line)
+                    participant["elite_markers"].append((line, bpm))
                 persist_elite(participant["client_id"], participant, engine.pop_events() or [])
                 render_elite_status(participant)
         start_session_error.visible = False
+        pause_btn.content = "Pause"
+        pause_btn.icon = ft.Icons.PAUSE
+        live_status.value = ""
+        elapsed_text.value = "00:00"
         refresh_session_controls()
+        set_live_view(True)
         page.update()
+
+    def start_session(e):
+        if not state["participants"]:
+            start_session_error.value = "Add at least one client and device before starting."
+            start_session_error.visible = True
+            page.update()
+            return
+        mode = state["mode"]
+        settings = None
+        if mode == elite.MODE_ELITE:
+            settings, error = elite.parse_settings(
+                elite_rounds_field.value, elite_round_field.value,
+                elite_recovered_field.value, elite_rest_field.value,
+            )
+            if error:
+                start_session_error.value = error
+                start_session_error.visible = True
+                page.update()
+                return
+        launch_session(mode, settings)
+
+    def toggle_pause(e):
+        """Pause freezes recording and every clock; the bars keep showing live heart rate."""
+        if not state["session_id"]:
+            return
+        now = time.monotonic()
+        if not state["paused"]:
+            state["paused"] = True
+            state["pause_started"] = now
+            pause_btn.content = "Resume"
+            pause_btn.icon = ft.Icons.PLAY_ARROW
+            live_status.value = "PAUSED - not recording"
+        else:
+            state["paused_total"] += now - state["pause_started"]
+            state["paused"] = False
+            state["pause_started"] = None
+            pause_btn.content = "Pause"
+            pause_btn.icon = ft.Icons.PAUSE
+            live_status.value = ""
+        page.update()
+
+    def discard_and_restart(e=None):
+        page.pop_dialog()
+        old_session = state["session_id"]
+        if not old_session:
+            return
+        db.delete_session(old_session)
+        state["session_id"] = None
+        for participant in state["participants"].values():
+            participant["engine"] = None
+            participant["max_streak"] = {}
+            participant["last_sample_time"] = None
+            participant["bar_fill"].width = 0
+            participant["hr_control"].value = "-- bpm"
+            participant["value_control"].value = ""
+            participant["phase_control"].value = ""
+            participant["phase_control"].visible = False
+        launch_session(state["mode"], state["elite"])
+
+    restart_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Restart this session?"),
+        content=ft.Text(
+            "Everything recorded so far will be discarded, and a new session starts straight away "
+            "with the same clients and settings."
+        ),
+        actions=[
+            ft.TextButton("Cancel", on_click=lambda e: page.pop_dialog()),
+            ft.FilledButton("Restart", on_click=discard_and_restart),
+        ],
+    )
+
+    def confirm_restart(e):
+        if state["session_id"]:
+            page.show_dialog(restart_dialog)
 
     def populate_elite_summary(session, session_id):
         params = db.session_mode_params(session)
@@ -669,7 +819,8 @@ def main(page: ft.Page):
 
         started_at = datetime.fromisoformat(session["started_at"])
         ended_at = datetime.fromisoformat(session["ended_at"]) if session["ended_at"] else None
-        duration_seconds = (ended_at - started_at).total_seconds() if ended_at else 0
+        paused_seconds = (session["paused_s"] or 0) if "paused_s" in session.keys() else 0
+        duration_seconds = max(0, (ended_at - started_at).total_seconds() - paused_seconds) if ended_at else 0
         summary_session_title.value = "Session Summary"
         summary_session_times.value = (
             f"Start: {format_session_timestamp(session['started_at'])}    "
@@ -764,18 +915,22 @@ def main(page: ft.Page):
 
     async def stop_session(e):
         completed_client_ids = list(state["participants"])
+        completed_session_id = None
         if state["session_id"]:
             completed_session_id = state["session_id"]
-            stop_now = time.monotonic()
+            stop_now = clock()
+            paused_s = state["paused_total"]
+            if state["paused"] and state["pause_started"] is not None:
+                paused_s += time.monotonic() - state["pause_started"]
             for cid, participant in state["participants"].items():
                 engine = participant.get("engine")
                 if engine and not engine.done:
                     persist_elite(cid, participant, engine.finish(stop_now))
-            db.end_session(completed_session_id)
+            db.end_session(completed_session_id, paused_s=paused_s)
             state["last_session_id"] = completed_session_id
-            refresh_summary_screen(completed_session_id)
-            export_btn.disabled = False
-            export_status.value = ""
+        state["paused"] = False
+        state["pause_started"] = None
+        state["paused_total"] = 0.0
         state["session_id"] = None
         state["session_start"] = None
         for participant in state["participants"].values():
@@ -790,15 +945,29 @@ def main(page: ft.Page):
         device_picker.value = None
         refresh_participant_chart()
         refresh_session_controls()
-        if state["last_session_id"] and completed_client_ids:
-            prompt_for_resting_hr(completed_client_ids)
-        else:
-            page.update()
+        set_live_view(False)                       # the Session tab is back to a fresh setup screen
+        if completed_session_id:
+            show_session_in_summary(completed_session_id)
+            tabs.selected_index = 2                # straight to the summary
+            if completed_client_ids:
+                prompt_for_resting_hr(completed_client_ids)
+                return
+        page.update()
 
     start_btn.on_click = start_session
     stop_btn.on_click = stop_session
 
-    session_tab = ft.Column(
+    # ---- live controls (shown instead of the setup screen while a session runs) ----
+    pause_btn = ft.FilledTonalButton("Pause", icon=ft.Icons.PAUSE, on_click=toggle_pause)
+    restart_btn = ft.OutlinedButton("Restart", icon=ft.Icons.RESTART_ALT, on_click=confirm_restart)
+    live_status = ft.Text("", size=18, weight=ft.FontWeight.BOLD, color=zones.ZONE_COLORS[3])
+    live_controls = ft.Row(
+        [pause_btn, stop_btn, restart_btn, elapsed_text, live_status],
+        alignment=ft.MainAxisAlignment.CENTER, spacing=20, visible=False, key="live-controls",
+    )
+    setup_buttons_row = ft.Row([start_btn], alignment=ft.MainAxisAlignment.CENTER, key="setup-buttons")
+
+    session_setup_group = ft.Column(
         [
             ft.Row([mode_picker]),
             elite_settings_row,
@@ -809,6 +978,11 @@ def main(page: ft.Page):
             ft.Row([attach_btn], alignment=ft.MainAxisAlignment.START),
             ft.Row([strap_status], alignment=ft.MainAxisAlignment.START),
             start_session_error,
+        ],
+        key="session-setup",
+    )
+    chart_header_group = ft.Column(
+        [
             ft.Divider(),
             ft.Row([ft.Text("Client", width=150), ft.Text("Heart rate vs. max HR"), ft.Text("Heart rate")], spacing=12),
             ft.Stack(
@@ -822,19 +996,48 @@ def main(page: ft.Page):
                 height=18,
             ),
             ft.Text("The dotted line marks 100% of estimated max HR. Bars may extend to 115%.", size=11, color=ft.Colors.GREY_400),
+        ],
+        key="chart-header",
+    )
+
+    session_tab = ft.Column(
+        [
+            session_setup_group,
+            chart_header_group,
             participant_chart,
             empty_chart_message,
-            ft.Row([start_btn, stop_btn], alignment=ft.MainAxisAlignment.CENTER, spacing=20),
-            elapsed_text,
+            setup_buttons_row,
+            live_controls,
             zone_legend,
         ],
         expand=True,
     )
+    session_container = ft.Container(session_tab, padding=20)
+
+    def set_live_view(is_live):
+        """Live: only the bars and Pause / Stop / Restart. Not live: the normal setup screen."""
+        for group in (session_setup_group, chart_header_group, setup_buttons_row, zone_legend):
+            group.visible = not is_live
+        live_controls.visible = is_live
+        tab_bar.visible = not is_live
+        session_container.padding = 8 if is_live else 20
+        elapsed_text.size = 28 if is_live else 16
+        if is_live:
+            apply_live_layout()
+        else:
+            apply_setup_layout()
+
+    def on_page_resize(e):
+        if state["session_id"]:
+            apply_live_layout()
+            page.update()
+
+    page.on_resize = on_page_resize
 
     export_status = ft.Text("", size=12, color=ft.Colors.GREY_400)
 
     async def export_last_session(e):
-        session_id = state["last_session_id"]
+        session_id = state["summary_session_id"] or state["last_session_id"]
         if not session_id:
             return
         export_btn.disabled = True
@@ -856,7 +1059,7 @@ def main(page: ft.Page):
         "Export to cloud", icon=ft.Icons.CLOUD_UPLOAD, disabled=True, on_click=export_last_session
     )
 
-    summary_tab = ft.Column(
+    summary_detail = ft.Column(
         [
             summary_session_title,
             summary_session_times,
@@ -884,9 +1087,59 @@ def main(page: ft.Page):
         scroll=ft.ScrollMode.AUTO,
     )
 
+    # ---- previous sessions (newest first); click one to look back at it ----
+    session_history_list = ft.ListView(spacing=2, expand=True)
+
+    def refresh_session_history():
+        tiles = []
+        for row in db.list_sessions():
+            ended = datetime.fromisoformat(row["ended_at"])
+            started = datetime.fromisoformat(row["started_at"])
+            length = max(0, (ended - started).total_seconds() - (row["paused_s"] or 0))
+            mode_label = "Elite" if row["mode"] == elite.MODE_ELITE else "Normal"
+            tiles.append(ft.ListTile(
+                title=ft.Text(format_session_timestamp(row["started_at"]), size=14),
+                subtitle=ft.Text(
+                    f"{mode_label} - {row['names'] or 'no participants'} - {format_session_duration(length)}",
+                    size=12, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
+                ),
+                dense=True,
+                selected=row["id"] == state["summary_session_id"],
+                on_click=lambda e, sid=row["id"]: show_session_in_summary(sid),
+            ))
+        session_history_list.controls = tiles or [ft.Text("No sessions yet.", color=ft.Colors.GREY_400)]
+
+    def show_session_in_summary(session_id):
+        state["summary_session_id"] = session_id
+        refresh_summary_screen(session_id)
+        export_btn.disabled = False
+        export_status.value = ""
+        refresh_session_history()
+        page.update()
+
+    summary_tab = ft.Row(
+        [
+            ft.Container(
+                ft.Column([ft.Text("Previous sessions", weight=ft.FontWeight.BOLD), session_history_list], expand=True),
+                width=340,
+            ),
+            ft.VerticalDivider(width=1),
+            summary_detail,
+        ],
+        expand=True,
+        vertical_alignment=ft.CrossAxisAlignment.START,
+    )
+
     # ==================================================================
     # LAYOUT
     # ==================================================================
+    tab_bar = ft.TabBar(
+        tabs=[
+            ft.Tab(label="Clients", icon=ft.Icons.PEOPLE),
+            ft.Tab(label="Session", icon=ft.Icons.FAVORITE),
+            ft.Tab(label="Summary", icon=ft.Icons.QUERY_STATS),
+        ]
+    )
     tabs = ft.Tabs(
         length=3,
         selected_index=0,
@@ -894,18 +1147,12 @@ def main(page: ft.Page):
         content=ft.Column(
             expand=True,
             controls=[
-                ft.TabBar(
-                    tabs=[
-                        ft.Tab(label="Clients", icon=ft.Icons.PEOPLE),
-                        ft.Tab(label="Session", icon=ft.Icons.FAVORITE),
-                        ft.Tab(label="Summary", icon=ft.Icons.QUERY_STATS),
-                    ]
-                ),
+                tab_bar,
                 ft.TabBarView(
                     expand=True,
                     controls=[
                         ft.Container(clients_tab, padding=20),
-                        ft.Container(session_tab, padding=20),
+                        session_container,
                         ft.Container(summary_tab, padding=20),
                     ],
                 ),
@@ -915,7 +1162,13 @@ def main(page: ft.Page):
     page.add(tabs)
     refresh_client_list()
     refresh_session_controls()
+    latest_sessions = db.list_sessions(1)
+    if latest_sessions:
+        show_session_in_summary(latest_sessions[0]["id"])      # open on the most recent session
+    else:
+        refresh_session_history()
 
 
 if __name__ == "__main__":
+    configure_ssl_environment()
     ft.run(main)

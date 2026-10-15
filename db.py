@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at TEXT,
     strap_device_id TEXT,
     notes TEXT,
+    paused_s REAL NOT NULL DEFAULT 0,      -- time the coach paused the session (excluded from duration)
     mode TEXT NOT NULL DEFAULT 'normal',   -- 'normal' | 'elite'
     mode_params TEXT                       -- JSON: elite settings plus each client's frozen zone 5 / recovered levels
 );
@@ -120,6 +121,8 @@ def init_db() -> None:
         if "strap_device_id" not in sample_columns:
             conn.execute("ALTER TABLE hr_samples ADD COLUMN strap_device_id TEXT")
         session_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if "paused_s" not in session_columns:
+            conn.execute("ALTER TABLE sessions ADD COLUMN paused_s REAL NOT NULL DEFAULT 0")
         if "mode" not in session_columns:
             conn.execute("ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal'")
         if "mode_params" not in session_columns:
@@ -212,12 +215,40 @@ def start_session(client_id: str, strap_device_id: str | None = None,
     return session_id
 
 
-def end_session(session_id: str, notes: str = "") -> None:
+def end_session(session_id: str, notes: str = "", paused_s: float = 0.0) -> None:
     with get_conn() as conn:
         conn.execute(
-            "UPDATE sessions SET ended_at = ?, notes = ? WHERE id = ?",
-            (datetime.utcnow().isoformat(), notes, session_id),
+            "UPDATE sessions SET ended_at = ?, notes = ?, paused_s = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), notes, round(paused_s, 1), session_id),
         )
+
+
+def delete_session(session_id: str) -> None:
+    """Removes a session and everything recorded in it (used by Restart to discard a false start)."""
+    with get_conn() as conn:
+        for table in ("elite_rounds", "session_phase_events", "hr_samples", "session_participants"):
+            conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+
+def list_sessions(limit: int = 100) -> list[sqlite3.Row]:
+    """Finished sessions, newest first, with the names of who took part."""
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT s.id, s.started_at, s.ended_at, s.mode, s.paused_s,
+                      COALESCE(
+                        (SELECT GROUP_CONCAT(c.first_name || ' ' || c.last_name, ', ')
+                           FROM session_participants AS sp
+                           JOIN clients AS c ON c.id = sp.client_id
+                          WHERE sp.session_id = s.id),
+                        (SELECT first_name || ' ' || last_name FROM clients WHERE id = s.client_id)
+                      ) AS names
+                 FROM sessions AS s
+                WHERE s.ended_at IS NOT NULL
+                ORDER BY s.started_at DESC
+                LIMIT ?""",
+            (limit,),
+        ).fetchall()
 
 
 def get_session(session_id: str) -> sqlite3.Row | None:
