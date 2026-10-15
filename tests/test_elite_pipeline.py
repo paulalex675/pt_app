@@ -161,6 +161,7 @@ class EliteCloudTests(unittest.TestCase):
             patcher, sid, ada, sam = make_elite_session(d)
             try:
                 first = next(r for r in export.build_client_exports(sid) if r["client_id"] == ada)
+                first["started_at"] = BASE.isoformat()        # fixed date: don't depend on today's clock
                 later = copy.deepcopy(first)
                 later["session_id"] = "later-session"
                 later["started_at"] = (BASE + timedelta(days=7)).isoformat()
