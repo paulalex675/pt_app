@@ -46,8 +46,10 @@ def _zone_index(hr, thresholds):
 def _summarise(bronze: dict) -> dict:
     samples = bronze["samples"]
     client = bronze["client"]
+    frozen = (bronze.get("elite") or {}).get("frozen") or {}
     thresholds = _zone_thresholds(
-        client.get("age_at_session"), client.get("resting_hr"), client.get("max_hr")
+        client.get("age_at_session"), client.get("resting_hr"),
+        frozen.get("max_hr") or client.get("max_hr"),
     )
 
     zone_seconds = [0.0] * 5
@@ -68,7 +70,7 @@ def _summarise(bronze: dict) -> dict:
     started = datetime.fromisoformat(bronze["started_at"])
     ended = datetime.fromisoformat(bronze["ended_at"]) if bronze.get("ended_at") else started
 
-    return {
+    summary = {
         "session_id": bronze["session_id"],
         "client_id": bronze["client_id"],
         "date": started.date().isoformat(),
@@ -81,6 +83,61 @@ def _summarise(bronze: dict) -> dict:
         "zone_seconds": [round(z, 1) for z in zone_seconds],
         "zone_pct": [round(100 * z / total, 1) for z in zone_seconds],
         "zone_names": ZONE_NAMES,
+    }
+    if bronze.get("mode") == "elite":
+        summary["elite"] = _summarise_elite(bronze)
+    return summary
+
+
+def _avg(values):
+    values = [v for v in values if v is not None]
+    return round(sum(values) / len(values), 1) if values else None
+
+
+def _summarise_elite(bronze: dict) -> dict:
+    """Per-round breakdown and totals for an elite session (one client)."""
+    elite = bronze.get("elite") or {}
+    params = elite.get("params") or {}
+    events = elite.get("events") or []
+
+    rounds = []
+    for r in sorted(elite.get("rounds") or [], key=lambda r: r["round_no"]):
+        drop = None
+        if r.get("hr_end_work") is not None and r.get("hr_60s") is not None:
+            drop = r["hr_end_work"] - r["hr_60s"]
+        rounds.append({
+            "round_no": r["round_no"],
+            "prework_s": r.get("prework_s"),
+            "work_s": r.get("work_s"),
+            "paused_s": r.get("paused_s"),
+            "recovery_s": r.get("recovery_s"),
+            "hr_drop_60": drop,
+            "flags": r.get("flags") or [],
+        })
+
+    total_s = None
+    if len(events) >= 2:
+        first = datetime.fromisoformat(events[0]["ts"])
+        last = datetime.fromisoformat(events[-1]["ts"])
+        total_s = round((last - first).total_seconds(), 1)
+
+    planned = params.get("rounds")
+    stopped = any("stopped" in r["flags"] for r in rounds)
+    capped = [r for r in rounds if any(f.endswith("_cap") for f in r["flags"])]
+    return {
+        "rounds_planned": planned,
+        "round_s": params.get("round_s"),
+        "target_rest_s": params.get("target_rest_s"),
+        "target_total_s": params.get("target_total_s"),
+        "total_s": total_s,
+        "completed": bool(rounds) and planned is not None and len(rounds) == planned and not stopped,
+        "capped_rounds": len(capped),
+        "round1_prework_s": rounds[0]["prework_s"] if rounds else None,
+        "avg_prework_s": _avg(r["prework_s"] for r in rounds),
+        "avg_paused_s": _avg(r["paused_s"] for r in rounds),
+        "avg_recovery_s": _avg(r["recovery_s"] for r in rounds),
+        "avg_hr_drop_60": _avg(r["hr_drop_60"] for r in rounds),
+        "rounds": rounds,
     }
 
 
@@ -106,6 +163,11 @@ def _update_gold(client_id: str, session_summary: dict):
             zone_totals[i] += pct
     gold["avg_zone_pct"] = [round(z / gold["session_count"], 1) for z in zone_totals]
     gold["last_session_at"] = gold["sessions"][-1]["started_at"]
+    # Elite history for the dashboard, rebuilt from the stored sessions so re-uploads never duplicate it.
+    gold["elite_sessions"] = [
+        {"session_id": s["session_id"], "date": s["date"], "started_at": s["started_at"], **s["elite"]}
+        for s in gold["sessions"] if s.get("elite")
+    ]
 
     s3.put_object(
         Bucket=BUCKET, Key=gold_key,

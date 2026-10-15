@@ -30,6 +30,17 @@ h1{font-size:clamp(1.8rem,4vw,2.6rem);font-weight:800;margin-bottom:.25rem}
 .session-list li:first-child{border-top:none}
 .session-list .date{color:var(--mute)}
 .state{color:var(--mute);text-align:center;padding:3rem 1rem}
+.elite-legend{color:var(--mute);font-size:.85rem;margin:.25rem 0 1rem}
+.elite-row{display:grid;grid-template-columns:5.5rem 1fr 3.5rem;gap:.8rem;align-items:center;margin-bottom:.7rem;font-size:.95rem}
+.elite-row b{text-align:right}
+.elite-track{position:relative;height:14px;background:var(--line);border-radius:7px}
+.elite-track i{display:block;height:100%;border-radius:7px;background:var(--z2)}
+.elite-track i.partial{background:var(--mute)}
+.elite-target{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--z4)}
+.elite-table{width:100%;border-collapse:collapse;font-size:.9rem}
+.elite-table th,.elite-table td{padding:.45rem .5rem;text-align:right;border-top:1px solid var(--line);white-space:nowrap}
+.elite-table th:first-child,.elite-table td:first-child{text-align:left}
+.elite-table th{color:var(--mute);font-weight:600;border-top:none}
 </style>
 </head>
 <body>
@@ -48,6 +59,14 @@ h1{font-size:clamp(1.8rem,4vw,2.6rem);font-weight:800;margin-bottom:.25rem}
   <div class="card">
     <h2 style="margin-bottom:1rem;font-size:1.2rem">Typical time in zone</h2>
     <div id="zone-bars"></div>
+  </div>
+
+  <div class="card" id="elite-card" style="display:none">
+    <h2 style="margin-bottom:0;font-size:1.2rem">Elite training</h2>
+    <p class="elite-legend" id="elite-legend"></p>
+    <div id="elite-chart"></div>
+    <h3 style="margin:1.25rem 0 .5rem;font-size:1rem" id="elite-latest-title"></h3>
+    <div style="overflow-x:auto"><table class="elite-table" id="elite-table"></table></div>
   </div>
 
   <div class="card">
@@ -92,6 +111,70 @@ async function loadSummary() {
   }
 }
 
+function fmtClock(sec) {
+  if (sec == null) return '--';
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function cell(tag, text) {
+  const el = document.createElement(tag);
+  el.textContent = text;
+  return el;
+}
+
+function renderElite(data) {
+  const sessions = (data.elite_sessions || []).filter(s => s.total_s != null);
+  if (!sessions.length) return;                       // no elite sessions: the card stays hidden
+  const latest = sessions[sessions.length - 1];
+  const target = latest.target_total_s;
+  const scale = Math.max(...sessions.map(s => s.total_s), target || 0) * 1.05;
+
+  document.getElementById('elite-legend').textContent =
+    (target ? `Total time per session. The amber line is the real fight length including rests (${fmtClock(target)}). ` : 'Total time per session. ')
+    + 'A grey bar marked * is a session that was stopped early.';
+
+  const chart = document.getElementById('elite-chart');
+  sessions.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'elite-row';
+    const track = document.createElement('div');
+    track.className = 'elite-track';
+    const bar = document.createElement('i');
+    bar.style.width = `${(s.total_s / scale) * 100}%`;
+    if (!s.completed) bar.className = 'partial';
+    track.appendChild(bar);
+    if (s.target_total_s) {
+      const marker = document.createElement('span');
+      marker.className = 'elite-target';
+      marker.style.left = `${(s.target_total_s / scale) * 100}%`;
+      track.appendChild(marker);
+    }
+    const total = cell('b', fmtClock(s.total_s) + (s.completed ? '' : '*'));
+    row.append(cell('span', fmtDate(s.started_at)), track, total);
+    chart.appendChild(row);
+  });
+
+  document.getElementById('elite-latest-title').textContent = `Latest session by round (${fmtDate(latest.started_at)})`;
+  const table = document.getElementById('elite-table');
+  const head = document.createElement('tr');
+  ['Round', 'Pre-work', 'Paused', 'Recovery', 'HR drop 60s'].forEach(h => head.appendChild(cell('th', h)));
+  table.appendChild(head);
+  latest.rounds.forEach(r => {
+    const tr = document.createElement('tr');
+    const note = (r.flags && r.flags.length) ? ` (${r.flags.join(', ')})` : '';
+    tr.append(
+      cell('td', `${r.round_no}${note}`),
+      cell('td', fmtClock(r.prework_s)),
+      cell('td', fmtClock(r.paused_s)),
+      cell('td', fmtClock(r.recovery_s)),
+      cell('td', r.hr_drop_60 == null ? '--' : `${r.hr_drop_60} bpm`),
+    );
+    table.appendChild(tr);
+  });
+  document.getElementById('elite-card').style.display = 'block';
+}
+
 function render(data) {
   document.getElementById('subtitle').textContent = `${data.session_count} session${data.session_count === 1 ? '' : 's'} tracked so far.`;
   document.getElementById('stat-sessions').textContent = data.session_count;
@@ -116,6 +199,7 @@ function render(data) {
     list.appendChild(li);
   });
 
+  renderElite(data);
   document.getElementById('content').style.display = 'block';
 }
 
