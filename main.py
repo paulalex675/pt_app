@@ -47,7 +47,7 @@ def load_client_thresholds(selected_client_id):
     if not client:
         return None
     age = db.client_age(client["dob"])
-    return zones.zone_thresholds(age, client["resting_hr"], client["max_hr"])
+    return zones.zone_thresholds(age, client["resting_hr"], db.client_max_hr(client)[0])
 
 
 CHART_MAX_PERCENT = 1.15
@@ -203,6 +203,7 @@ def main(page: ft.Page):
 
     def refresh_client_list():
         client_list_view.controls.clear()
+        edit_max_hr_btn.disabled = not state["selected_client_id"]
         for c in db.list_clients(client_search.value or ""):
             age = db.client_age(c["dob"])
             subtitle_bits = []
@@ -212,7 +213,9 @@ def main(page: ft.Page):
                 subtitle_bits.append(c["sex"])
             if c["resting_hr"]:
                 subtitle_bits.append(f"RHR {c['resting_hr']}")
-            if c["max_hr"]:
+            if c["max_hr_manual"]:
+                subtitle_bits.append(f"Max HR {c['max_hr_manual']} (set manually)")
+            elif c["max_hr"]:
                 subtitle_bits.append(f"Max HR {c['max_hr']}")
             is_selected = c["id"] == state["selected_client_id"]
             client_list_view.controls.append(
@@ -242,6 +245,10 @@ def main(page: ft.Page):
     f_height = ft.TextField(label="Height (cm)", width=250, keyboard_type=ft.KeyboardType.NUMBER)
     f_weight = ft.TextField(label="Weight (kg)", width=250, keyboard_type=ft.KeyboardType.NUMBER)
     f_resting_hr = ft.TextField(label="Resting HR (bpm, optional)", width=250, keyboard_type=ft.KeyboardType.NUMBER)
+    f_max_hr = ft.TextField(
+        label="Max HR override (bpm, optional)", width=250, keyboard_type=ft.KeyboardType.NUMBER,
+        helper="Only for medical advice or a known true max below 220 - age",
+    )
     f_error = ft.Text(color=ft.Colors.RED_300, visible=False)
 
     def close_dialog(e=None):
@@ -257,18 +264,21 @@ def main(page: ft.Page):
             height = float(f_height.value) if f_height.value else None
             weight = float(f_weight.value) if f_weight.value else None
             resting_hr = int(f_resting_hr.value) if f_resting_hr.value else None
+            max_hr_manual = int(f_max_hr.value) if f_max_hr.value else None
+            if max_hr_manual is not None and not zones.valid_manual_max_hr(max_hr_manual):
+                raise ValueError("max hr")
             dob = f_dob.value.strip() if f_dob.value else None
             if dob:
                 from datetime import date
                 date.fromisoformat(dob)  # validates format
         except ValueError:
-            f_error.value = "Check DOB is YYYY-MM-DD and numbers are valid."
+            f_error.value = "Check DOB is YYYY-MM-DD, numbers are valid, and max HR is 100-220 bpm."
             f_error.visible = True
             page.update()
             return
 
-        db.create_client(f_first.value, f_last.value, f_sex.value, dob, height, weight, resting_hr)
-        for f in (f_first, f_last, f_sex, f_dob, f_height, f_weight, f_resting_hr):
+        db.create_client(f_first.value, f_last.value, f_sex.value, dob, height, weight, resting_hr, max_hr_manual)
+        for f in (f_first, f_last, f_sex, f_dob, f_height, f_weight, f_resting_hr, f_max_hr):
             f.value = None
         f_error.visible = False
         close_dialog()
@@ -278,8 +288,8 @@ def main(page: ft.Page):
         modal=True,
         title=ft.Text("New client"),
         content=ft.Column(
-            [f_first, f_last, f_sex, f_dob, f_height, f_weight, f_resting_hr, f_error],
-            tight=True, spacing=10, scroll=ft.ScrollMode.AUTO, height=420,
+            [f_first, f_last, f_sex, f_dob, f_height, f_weight, f_resting_hr, f_max_hr, f_error],
+            tight=True, spacing=10, scroll=ft.ScrollMode.AUTO, height=480,
         ),
         actions=[ft.TextButton("Cancel", on_click=close_dialog), ft.FilledButton("Save", on_click=save_client)],
     )
@@ -287,9 +297,53 @@ def main(page: ft.Page):
     def open_add_client(e):
         page.show_dialog(add_client_dialog)
 
+    # ---- edit max HR (selected client) ----
+    edit_max_hr_field = ft.TextField(
+        label="Max HR override (bpm)", width=260, keyboard_type=ft.KeyboardType.NUMBER,
+        helper="Leave blank to go back to the learned / age-based value",
+    )
+    edit_max_hr_error = ft.Text(color=ft.Colors.RED_300, visible=False)
+    edit_max_hr_title = ft.Text("Max heart rate")
+
+    def save_max_hr_override(e):
+        client_id = state["selected_client_id"]
+        raw = (edit_max_hr_field.value or "").strip()
+        try:
+            value = int(raw) if raw else None
+            if value is not None and not zones.valid_manual_max_hr(value):
+                raise ValueError("range")
+        except ValueError:
+            edit_max_hr_error.value = "Enter a max heart rate from 100 to 220 bpm, or leave it blank."
+            edit_max_hr_error.visible = True
+            page.update()
+            return
+        db.set_client_max_hr_manual(client_id, value)
+        edit_max_hr_error.visible = False
+        close_dialog()
+        refresh_client_list()
+
+    edit_max_hr_dialog = ft.AlertDialog(
+        modal=True,
+        title=edit_max_hr_title,
+        content=ft.Column([edit_max_hr_field, edit_max_hr_error], tight=True, spacing=10),
+        actions=[ft.TextButton("Cancel", on_click=close_dialog), ft.FilledButton("Save", on_click=save_max_hr_override)],
+    )
+
+    def open_edit_max_hr(e):
+        client = db.get_client(state["selected_client_id"]) if state["selected_client_id"] else None
+        if not client:
+            return
+        edit_max_hr_title.value = f"Max heart rate - {client['first_name']} {client['last_name']}"
+        edit_max_hr_field.value = str(client["max_hr_manual"]) if client["max_hr_manual"] else ""
+        edit_max_hr_error.visible = False
+        page.show_dialog(edit_max_hr_dialog)
+
+    edit_max_hr_btn = ft.OutlinedButton("Set max HR", icon=ft.Icons.FAVORITE, on_click=open_edit_max_hr, disabled=True)
+
     clients_tab = ft.Column(
         [
-            ft.Row([client_search, ft.FilledButton("New client", icon=ft.Icons.PERSON_ADD, on_click=open_add_client)],
+            ft.Row([client_search, edit_max_hr_btn,
+                    ft.FilledButton("New client", icon=ft.Icons.PERSON_ADD, on_click=open_add_client)],
                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             ft.Divider(),
             client_list_view,
@@ -360,7 +414,7 @@ def main(page: ft.Page):
         client = db.get_client(client_id)
         client_name = f"{client['first_name']} {client['last_name']}"
         age = db.client_age(client["dob"])
-        max_hr = client["max_hr"] or zones.estimate_max_hr(age)
+        max_hr, max_hr_source = db.client_max_hr(client)
         name_control = ft.Text(client_name, width=150, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
         hr_control = ft.Text("-- bpm", width=64, text_align=ft.TextAlign.RIGHT)
         bar_fill = ft.Container(left=0, top=5, width=0, height=24, bgcolor=zones.ZONE_COLORS[0], border_radius=3)
@@ -390,6 +444,7 @@ def main(page: ft.Page):
             "device_name": device["name"],
             "name": client_name,
             "max_hr": max_hr,
+            "max_hr_locked": max_hr_source == "manual",
             "thresholds": load_client_thresholds(client_id),
             "last_sample_time": None,
             "max_streak": {},
@@ -524,7 +579,7 @@ def main(page: ft.Page):
         if not participant:
             return
         recording = bool(state["session_id"]) and not state["paused"]
-        if recording:
+        if recording and not participant.get("max_hr_locked"):
             confirmed_max = zones.track_new_max(participant["max_streak"], hr, participant["max_hr"])
             if confirmed_max:
                 participant["max_hr"] = db.update_client_max_hr(client_id, confirmed_max) or confirmed_max

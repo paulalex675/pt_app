@@ -74,7 +74,8 @@ def build_client_exports(session_id: str) -> list[dict]:
                 "height_cm": client["height_cm"],
                 "weight_kg": client["weight_kg"],
                 "resting_hr": client["resting_hr"],
-                "max_hr": client["max_hr"],
+                "max_hr": client["max_hr_manual"] or client["max_hr"],
+                "max_hr_source": "manual" if client["max_hr_manual"] else ("observed" if client["max_hr"] else "estimated"),
             },
             "samples": [
                 {

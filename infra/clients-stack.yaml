@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  PT Studio client database - trainees and their health profiles, as two
+  physically separate tables. Payers stay in the invoicing table (CUSTOMER
+  items); a trainee points at its payer through payer_id. This stack never
+  touches the invoicing table.
+
+Resources:
+
+  # One item per person who trains. trainee_id is the SAME uuid PT Studio uses
+  # as client_id, so bronze/silver/gold data already lines up with it.
+  # payer_id = the sk of a CUSTOMER item in the invoicing table. DynamoDB can't
+  # enforce a foreign key, so the API layer must check the payer exists on write.
+  TraineesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: pt-trainees
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: trainee_id, AttributeType: S }
+        - { AttributeName: payer_id,   AttributeType: S }
+      KeySchema:
+        - { AttributeName: trainee_id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by_payer          # "all trainees for this payer" (one parent, several children)
+          KeySchema:
+            - { AttributeName: payer_id,   KeyType: HASH }
+            - { AttributeName: trainee_id, KeyType: RANGE }
+          Projection:
+            ProjectionType: ALL
+
+  # Special-category (health) data kept apart so it can have tighter access,
+  # its own retention and its own erasure path. Same key as the trainee.
+  HealthProfilesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: pt-health-profiles
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: trainee_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: trainee_id, KeyType: HASH }
+
+Outputs:
+  TraineesTableName:
+    Value: !Ref TraineesTable
+  HealthProfilesTableName:
+    Value: !Ref HealthProfilesTable

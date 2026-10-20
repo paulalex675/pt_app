@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS clients (
     height_cm REAL,
     weight_kg REAL,
     resting_hr INTEGER,        -- nullable, bpm
-    max_hr INTEGER,            -- nullable, highest observed bpm
+    max_hr INTEGER,            -- nullable, highest observed bpm (learned by the app)
+    max_hr_manual INTEGER,     -- nullable, set by the coach; always wins, never auto-changed
     created_at TEXT NOT NULL
 );
 
@@ -115,6 +116,8 @@ def init_db() -> None:
         client_columns = {row["name"] for row in conn.execute("PRAGMA table_info(clients)")}
         if "max_hr" not in client_columns:
             conn.execute("ALTER TABLE clients ADD COLUMN max_hr INTEGER")
+        if "max_hr_manual" not in client_columns:
+            conn.execute("ALTER TABLE clients ADD COLUMN max_hr_manual INTEGER")
         sample_columns = {row["name"] for row in conn.execute("PRAGMA table_info(hr_samples)")}
         if "client_id" not in sample_columns:
             conn.execute("ALTER TABLE hr_samples ADD COLUMN client_id TEXT REFERENCES clients(id)")
@@ -138,15 +141,15 @@ def init_db() -> None:
 
 def create_client(first_name, last_name, sex=None, dob: str | None = None,
                    height_cm: float | None = None, weight_kg: float | None = None,
-                   resting_hr: int | None = None) -> str:
+                   resting_hr: int | None = None, max_hr_manual: int | None = None) -> str:
     client_id = str(uuid.uuid4())
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO clients
-               (id, first_name, last_name, sex, dob, height_cm, weight_kg, resting_hr, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, first_name, last_name, sex, dob, height_cm, weight_kg, resting_hr, max_hr_manual, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (client_id, first_name.strip(), last_name.strip(), sex, dob,
-             height_cm, weight_kg, resting_hr, datetime.utcnow().isoformat()),
+             height_cm, weight_kg, resting_hr, max_hr_manual, datetime.utcnow().isoformat()),
         )
     return client_id
 
@@ -179,6 +182,18 @@ def update_client_resting_hr(client_id: str, resting_hr: int) -> None:
             "UPDATE clients SET resting_hr = ? WHERE id = ?",
             (resting_hr, client_id),
         )
+
+
+def set_client_max_hr_manual(client_id: str, value: int | None) -> None:
+    """Set (or clear, with None) the coach-entered max HR."""
+    with get_conn() as conn:
+        conn.execute("UPDATE clients SET max_hr_manual = ? WHERE id = ?", (value, client_id))
+
+
+def client_max_hr(client) -> tuple[int, str]:
+    """(max_hr, source) for a clients row: manual > observed > age estimate."""
+    import zones
+    return zones.resolve_max_hr(client_age(client["dob"]), client["max_hr_manual"], client["max_hr"])
 
 
 def update_client_max_hr(client_id: str, observed_hr: int) -> int | None:

@@ -24,6 +24,27 @@ def estimate_max_hr(age: int | None) -> int:
     return round(208 - 0.7 * age)
 
 
+MIN_MANUAL_MAX_HR, MAX_MANUAL_MAX_HR = 100, 220
+
+
+def valid_manual_max_hr(value) -> bool:
+    return isinstance(value, int) and MIN_MANUAL_MAX_HR <= value <= MAX_MANUAL_MAX_HR
+
+
+def resolve_max_hr(age: int | None, manual: int | None, observed: int | None) -> tuple[int, str]:
+    """Which max HR to use, and where it came from.
+
+    A manually entered value (medical advice, or a person whose true maximum is
+    well below 220 - age) always wins and is never changed by the app. Otherwise
+    the highest confirmed reading, otherwise the age-based estimate.
+    """
+    if manual:
+        return manual, "manual"
+    if observed:
+        return observed, "observed"
+    return estimate_max_hr(age), "estimated"
+
+
 def zone_thresholds(
     age: int | None,
     resting_hr: int | None,
