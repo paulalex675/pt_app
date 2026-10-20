@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 import flet as ft
 
+import cloud_sync
 import db
 import elite
 import zones
@@ -203,7 +204,7 @@ def main(page: ft.Page):
 
     def refresh_client_list():
         client_list_view.controls.clear()
-        edit_max_hr_btn.disabled = not state["selected_client_id"]
+        edit_client_btn.disabled = not state["selected_client_id"]
         for c in db.list_clients(client_search.value or ""):
             age = db.client_age(c["dob"])
             subtitle_bits = []
@@ -217,6 +218,8 @@ def main(page: ft.Page):
                 subtitle_bits.append(f"Max HR {c['max_hr_manual']} (set manually)")
             elif c["max_hr"]:
                 subtitle_bits.append(f"Max HR {c['max_hr']}")
+            if c["payer_id"]:
+                subtitle_bits.append(f"Bill payer: {db.payer_name(c['payer_id']) or 'unknown'}")
             is_selected = c["id"] == state["selected_client_id"]
             client_list_view.controls.append(
                 ft.ListTile(
@@ -249,6 +252,20 @@ def main(page: ft.Page):
         label="Max HR override (bpm, optional)", width=250, keyboard_type=ft.KeyboardType.NUMBER,
         helper="Only for medical advice or a known true max below 220 - age",
     )
+    SELF_PAYER = "__self__"
+
+    def payer_options():
+        return [ft.dropdown.Option(key=SELF_PAYER, text="Pays for themselves")] + [
+            ft.dropdown.Option(key=p["id"], text=p["name"]) for p in db.list_payers()
+        ]
+
+    def payer_value(dropdown):
+        return None if dropdown.value in (None, "", SELF_PAYER) else dropdown.value
+
+    f_payer = ft.Dropdown(
+        label="Bill payer", width=250, value=SELF_PAYER, options=payer_options(),
+        helper_text="From your invoicing customers (needs a sync)",
+    )
     f_error = ft.Text(color=ft.Colors.RED_300, visible=False)
 
     def close_dialog(e=None):
@@ -277,35 +294,40 @@ def main(page: ft.Page):
             page.update()
             return
 
-        db.create_client(f_first.value, f_last.value, f_sex.value, dob, height, weight, resting_hr, max_hr_manual)
+        db.create_client(f_first.value, f_last.value, f_sex.value, dob, height, weight, resting_hr, max_hr_manual,
+                         payer_id=payer_value(f_payer))
+        f_payer.value = SELF_PAYER
         for f in (f_first, f_last, f_sex, f_dob, f_height, f_weight, f_resting_hr, f_max_hr):
             f.value = None
         f_error.visible = False
         close_dialog()
         refresh_client_list()
+        queue_sync()
 
     add_client_dialog = ft.AlertDialog(
         modal=True,
         title=ft.Text("New client"),
         content=ft.Column(
-            [f_first, f_last, f_sex, f_dob, f_height, f_weight, f_resting_hr, f_max_hr, f_error],
-            tight=True, spacing=10, scroll=ft.ScrollMode.AUTO, height=480,
+            [f_first, f_last, f_sex, f_dob, f_height, f_weight, f_resting_hr, f_max_hr, f_payer, f_error],
+            tight=True, spacing=10, scroll=ft.ScrollMode.AUTO, height=540,
         ),
         actions=[ft.TextButton("Cancel", on_click=close_dialog), ft.FilledButton("Save", on_click=save_client)],
     )
 
     def open_add_client(e):
+        f_payer.options = payer_options()          # latest synced payer list
         page.show_dialog(add_client_dialog)
 
-    # ---- edit max HR (selected client) ----
+    # ---- edit selected client: max HR + bill payer ----
     edit_max_hr_field = ft.TextField(
         label="Max HR override (bpm)", width=260, keyboard_type=ft.KeyboardType.NUMBER,
         helper="Leave blank to go back to the learned / age-based value",
     )
-    edit_max_hr_error = ft.Text(color=ft.Colors.RED_300, visible=False)
-    edit_max_hr_title = ft.Text("Max heart rate")
+    edit_payer = ft.Dropdown(label="Bill payer", width=260, options=[])
+    edit_error = ft.Text(color=ft.Colors.RED_300, visible=False)
+    edit_title = ft.Text("Edit client")
 
-    def save_max_hr_override(e):
+    def save_client_edits(e):
         client_id = state["selected_client_id"]
         raw = (edit_max_hr_field.value or "").strip()
         try:
@@ -313,38 +335,72 @@ def main(page: ft.Page):
             if value is not None and not zones.valid_manual_max_hr(value):
                 raise ValueError("range")
         except ValueError:
-            edit_max_hr_error.value = "Enter a max heart rate from 100 to 220 bpm, or leave it blank."
-            edit_max_hr_error.visible = True
+            edit_error.value = "Enter a max heart rate from 100 to 220 bpm, or leave it blank."
+            edit_error.visible = True
             page.update()
             return
         db.set_client_max_hr_manual(client_id, value)
-        edit_max_hr_error.visible = False
+        db.set_client_payer(client_id, payer_value(edit_payer))
+        edit_error.visible = False
         close_dialog()
         refresh_client_list()
+        queue_sync()
 
-    edit_max_hr_dialog = ft.AlertDialog(
+    edit_client_dialog = ft.AlertDialog(
         modal=True,
-        title=edit_max_hr_title,
-        content=ft.Column([edit_max_hr_field, edit_max_hr_error], tight=True, spacing=10),
-        actions=[ft.TextButton("Cancel", on_click=close_dialog), ft.FilledButton("Save", on_click=save_max_hr_override)],
+        title=edit_title,
+        content=ft.Column([edit_max_hr_field, edit_payer, edit_error], tight=True, spacing=10),
+        actions=[ft.TextButton("Cancel", on_click=close_dialog), ft.FilledButton("Save", on_click=save_client_edits)],
     )
 
-    def open_edit_max_hr(e):
+    def open_edit_client(e):
         client = db.get_client(state["selected_client_id"]) if state["selected_client_id"] else None
         if not client:
             return
-        edit_max_hr_title.value = f"Max heart rate - {client['first_name']} {client['last_name']}"
+        edit_title.value = f"Edit - {client['first_name']} {client['last_name']}"
         edit_max_hr_field.value = str(client["max_hr_manual"]) if client["max_hr_manual"] else ""
-        edit_max_hr_error.visible = False
-        page.show_dialog(edit_max_hr_dialog)
+        edit_payer.options = payer_options()
+        edit_payer.value = client["payer_id"] or SELF_PAYER
+        edit_error.visible = False
+        page.show_dialog(edit_client_dialog)
 
-    edit_max_hr_btn = ft.OutlinedButton("Set max HR", icon=ft.Icons.FAVORITE, on_click=open_edit_max_hr, disabled=True)
+    edit_client_btn = ft.OutlinedButton("Edit client", icon=ft.Icons.EDIT, on_click=open_edit_client, disabled=True)
+
+    # ---- cloud sync (offline-first; only visible once PT_TRAINEES_TABLE is set) ----
+    sync_status = ft.Text("", size=12, color=ft.Colors.GREY_400)
+    sync_state = {"running": False}
+
+    async def sync_clients(e=None):
+        if sync_state["running"] or not cloud_sync.is_enabled():
+            return
+        sync_state["running"] = True
+        sync_status.value = "Syncing..."
+        sync_status.color = ft.Colors.GREY_400
+        page.update()
+        try:
+            result = await asyncio.to_thread(cloud_sync.sync)
+            sync_status.value = result.summary()
+            sync_status.color = ft.Colors.GREEN_400 if result.ok else ft.Colors.ORANGE_300
+        except Exception as ex:                                  # never let sync break the app
+            sync_status.value = f"Sync failed: {ex}"
+            sync_status.color = ft.Colors.RED_300
+        finally:
+            sync_state["running"] = False
+        refresh_client_list()
+
+    def queue_sync():
+        if cloud_sync.is_enabled():
+            page.run_task(sync_clients)
+
+    sync_btn = ft.OutlinedButton("Sync", icon=ft.Icons.SYNC, on_click=sync_clients,
+                                 visible=cloud_sync.is_enabled())
 
     clients_tab = ft.Column(
         [
-            ft.Row([client_search, edit_max_hr_btn,
+            ft.Row([client_search, edit_client_btn, sync_btn,
                     ft.FilledButton("New client", icon=ft.Icons.PERSON_ADD, on_click=open_add_client)],
                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            sync_status,
             ft.Divider(),
             client_list_view,
         ],
@@ -1104,6 +1160,7 @@ def main(page: ft.Page):
             keys = await asyncio.to_thread(export_module.upload_session, session_id)
             export_status.value = f"Uploaded {len(keys)} client record(s)."
             export_status.color = ft.Colors.GREEN_400
+            queue_sync()                      # a session can raise a learned max HR; share it
         except Exception as ex:
             export_status.value = f"Upload failed: {ex}"
             export_status.color = ft.Colors.RED_300
@@ -1217,6 +1274,7 @@ def main(page: ft.Page):
     page.add(tabs)
     refresh_client_list()
     refresh_session_controls()
+    queue_sync()
     latest_sessions = db.list_sessions(1)
     if latest_sessions:
         show_session_in_summary(latest_sessions[0]["id"])      # open on the most recent session

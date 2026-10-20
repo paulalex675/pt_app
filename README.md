@@ -100,6 +100,49 @@ Then:
 3. End a session, open the **Summary** tab, press **Export to cloud**, then open
    `dashboard/index.html`.
 
+## Client database and cloud sync
+
+PT Studio always works from its local `pt_studio.db`, so a session never waits on the
+internet. The cloud copy exists so your desktop and MacBook share one client list, and so
+trainees can be linked to whoever pays for them.
+
+- **Trainees** (names, bill payer) and **health profiles** (sex, DOB, height, weight,
+  resting HR, max HR) live in two separate tables, `pt-trainees` and `pt-health-profiles`.
+- **Payers** are the `CUSTOMER` items in your invoicing table. A trainee's `payer_id` points
+  at one; leave it blank for someone who pays for themselves. PT Studio only ever *reads*
+  the payer list - it never writes to the invoicing table.
+- **Max HR override**: set it per client (New client, or Edit client). It beats the learned
+  and age-based values and is never changed automatically.
+- **When it syncs**: on startup, after adding/editing a client, after exporting a session,
+  and from the Sync button. Offline is fine - edits queue and go next time. If both machines
+  edit the same person, the newer edit wins.
+
+Deploy once (needs the invoicing table name):
+
+```bash
+cd infra
+aws cloudformation deploy --template-file clients-stack.yaml --stack-name pt-studio-clients \
+  --parameter-overrides InvoicingTableName="$INVOICING_TABLE" \
+  --capabilities CAPABILITY_NAMED_IAM --profile pt
+```
+
+Then in IAM Identity Center, add the customer managed policy **PtStudioSync** (created by that
+stack) to the `pt-uploader` permission set. It allows read/write on the two client tables and
+a read-only query of the `CUSTOMER` items - not invoices, not emails, not the counter.
+
+Finally turn sync on where you run the app (it stays off until you do):
+
+```bash
+export PT_TRAINEES_TABLE=pt-trainees
+export PT_INVOICING_TABLE="$INVOICING_TABLE"     # fills the Bill payer dropdown
+```
+
+Optional first step: `python tools/propose_links.py --table "$INVOICING_TABLE" --profile pt`
+suggests which payer each existing client belongs to, without writing anything.
+
+Erasing a client from the cloud tables: `python -c "import cloud_sync; cloud_sync.delete_trainee('<client_id>')"`
+(needs an admin profile; the sync policy deliberately cannot delete).
+
 ### Erasing a client (UK GDPR)
 
 ```bash
@@ -176,8 +219,11 @@ what gets deployed or tested.
 
 ```
 main.py  elite.py  db.py  export.py  zones.py  ble_client.py       the desktop app
+cloud_sync.py                                                        client list sync (offline-first)
+tools/propose_links.py                                               read-only payer-link suggestions
 lambda/silver_transform.py  lambda/api_summary.py                    what `sam deploy` ships
-infra/template.yaml                                                  AWS stack (samconfig.toml stays local)
+infra/template.yaml                                                  data pipeline stack (samconfig.toml stays local)
+infra/clients-stack.yaml                                             client database + sync permission
 dashboard/index.html                                                 the client dashboard
 tests/                                                               all tests live here
 ```

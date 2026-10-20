@@ -26,7 +26,16 @@ CREATE TABLE IF NOT EXISTS clients (
     resting_hr INTEGER,        -- nullable, bpm
     max_hr INTEGER,            -- nullable, highest observed bpm (learned by the app)
     max_hr_manual INTEGER,     -- nullable, set by the coach; always wins, never auto-changed
+    payer_id TEXT,             -- nullable: sk of a CUSTOMER item in the invoicing table; NULL = pays for themselves
+    updated_at TEXT,           -- last local edit (UTC ISO); drives last-edit-wins sync
+    synced_at TEXT,            -- when this row was last pushed/pulled; NULL or < updated_at = needs pushing
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payers_cache (
+    id TEXT PRIMARY KEY,       -- invoicing CUSTOMER sk
+    name TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -118,6 +127,10 @@ def init_db() -> None:
             conn.execute("ALTER TABLE clients ADD COLUMN max_hr INTEGER")
         if "max_hr_manual" not in client_columns:
             conn.execute("ALTER TABLE clients ADD COLUMN max_hr_manual INTEGER")
+        for column in ("payer_id", "updated_at", "synced_at"):
+            if column not in client_columns:
+                conn.execute(f"ALTER TABLE clients ADD COLUMN {column} TEXT")
+        conn.execute("UPDATE clients SET updated_at = created_at WHERE updated_at IS NULL")
         sample_columns = {row["name"] for row in conn.execute("PRAGMA table_info(hr_samples)")}
         if "client_id" not in sample_columns:
             conn.execute("ALTER TABLE hr_samples ADD COLUMN client_id TEXT REFERENCES clients(id)")
@@ -139,17 +152,23 @@ def init_db() -> None:
 
 # ---------- clients ----------
 
+def _now() -> str:
+    return datetime.utcnow().isoformat(timespec="microseconds")
+
+
 def create_client(first_name, last_name, sex=None, dob: str | None = None,
                    height_cm: float | None = None, weight_kg: float | None = None,
-                   resting_hr: int | None = None, max_hr_manual: int | None = None) -> str:
+                   resting_hr: int | None = None, max_hr_manual: int | None = None,
+                  payer_id: str | None = None) -> str:
     client_id = str(uuid.uuid4())
     with get_conn() as conn:
         conn.execute(
             """INSERT INTO clients
-               (id, first_name, last_name, sex, dob, height_cm, weight_kg, resting_hr, max_hr_manual, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (id, first_name, last_name, sex, dob, height_cm, weight_kg, resting_hr, max_hr_manual,
+                created_at, payer_id, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (client_id, first_name.strip(), last_name.strip(), sex, dob,
-             height_cm, weight_kg, resting_hr, max_hr_manual, datetime.utcnow().isoformat()),
+             height_cm, weight_kg, resting_hr, max_hr_manual, (now := _now()), payer_id or None, now),
         )
     return client_id
 
@@ -179,15 +198,88 @@ def get_client(client_id: str) -> sqlite3.Row | None:
 def update_client_resting_hr(client_id: str, resting_hr: int) -> None:
     with get_conn() as conn:
         conn.execute(
-            "UPDATE clients SET resting_hr = ? WHERE id = ?",
-            (resting_hr, client_id),
+            "UPDATE clients SET resting_hr = ?, updated_at = ? WHERE id = ?",
+            (resting_hr, _now(), client_id),
         )
+
+
+def raise_observed_max_hr(client_id: str, value: int | None) -> None:
+    """Quietly adopt a higher learned max from the cloud (not a local edit, so no re-push)."""
+    if not value:
+        return
+    with get_conn() as conn:
+        conn.execute("UPDATE clients SET max_hr = ? WHERE id = ? AND (max_hr IS NULL OR max_hr < ?)",
+                     (value, client_id, value))
+
+
+def set_client_payer(client_id: str, payer_id: str | None) -> None:
+    """Link a trainee to a payer (None = pays for themselves)."""
+    with get_conn() as conn:
+        conn.execute("UPDATE clients SET payer_id = ?, updated_at = ? WHERE id = ?",
+                     (payer_id or None, _now(), client_id))
+
+
+# ---------- payers (read-only copy of the invoicing CUSTOMER items) ----------
+
+def replace_payers(payers: list[dict]) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM payers_cache")
+        now = _now()
+        conn.executemany("INSERT INTO payers_cache (id, name, fetched_at) VALUES (?, ?, ?)",
+                         [(p["id"], p["name"], now) for p in payers])
+
+
+def list_payers() -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM payers_cache ORDER BY lower(name)").fetchall()
+
+
+def payer_name(payer_id: str | None) -> str | None:
+    if not payer_id:
+        return None
+    with get_conn() as conn:
+        row = conn.execute("SELECT name FROM payers_cache WHERE id = ?", (payer_id,)).fetchone()
+        return row["name"] if row else None
+
+
+# ---------- sync bookkeeping ----------
+
+def dirty_clients() -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM clients WHERE synced_at IS NULL OR synced_at < updated_at"
+        ).fetchall()
+
+
+def mark_synced(client_id: str, pushed_updated_at: str) -> None:
+    """Mark a row clean - but only if it wasn't edited again while the push was in flight."""
+    with get_conn() as conn:
+        conn.execute("UPDATE clients SET synced_at = ? WHERE id = ? AND updated_at <= ?",
+                     (pushed_updated_at, client_id, pushed_updated_at))
+
+
+def apply_cloud_client(record: dict) -> None:
+    """Insert or overwrite a local client from a cloud record (already merged by cloud_sync)."""
+    cols = ("first_name", "last_name", "sex", "dob", "height_cm", "weight_kg", "resting_hr",
+            "max_hr", "max_hr_manual", "payer_id", "created_at", "updated_at")
+    values = [record.get(c) for c in cols]
+    with get_conn() as conn:
+        exists = conn.execute("SELECT 1 FROM clients WHERE id = ?", (record["id"],)).fetchone()
+        if exists:
+            conn.execute(
+                "UPDATE clients SET " + ", ".join(f"{c} = ?" for c in cols) + ", synced_at = ? WHERE id = ?",
+                values + [record["synced_at"], record["id"]])
+        else:
+            conn.execute(
+                "INSERT INTO clients (id, " + ", ".join(cols) + ", synced_at) VALUES (?, "
+                + ", ".join("?" for _ in cols) + ", ?)",
+                [record["id"]] + values + [record["synced_at"]])
 
 
 def set_client_max_hr_manual(client_id: str, value: int | None) -> None:
     """Set (or clear, with None) the coach-entered max HR."""
     with get_conn() as conn:
-        conn.execute("UPDATE clients SET max_hr_manual = ? WHERE id = ?", (value, client_id))
+        conn.execute("UPDATE clients SET max_hr_manual = ?, updated_at = ? WHERE id = ?", (value, _now(), client_id))
 
 
 def client_max_hr(client) -> tuple[int, str]:
@@ -199,9 +291,9 @@ def client_max_hr(client) -> tuple[int, str]:
 def update_client_max_hr(client_id: str, observed_hr: int) -> int | None:
     with get_conn() as conn:
         conn.execute(
-            """UPDATE clients SET max_hr = ?
+            """UPDATE clients SET max_hr = ?, updated_at = ?
                WHERE id = ? AND (max_hr IS NULL OR max_hr < ?)""",
-            (observed_hr, client_id, observed_hr),
+            (observed_hr, _now(), client_id, observed_hr),
         )
         row = conn.execute("SELECT max_hr FROM clients WHERE id = ?", (client_id,)).fetchone()
         return row["max_hr"] if row else None

@@ -98,7 +98,7 @@ class ScreenTests(ScreenTestCase):
 
     def _open_edit(self):
         self.pick(self.dropdown("Select client for session"), self.ada)
-        self.button("Set max HR").on_click(None)
+        self.button("Edit client").on_click(None)
         dialog = self.page.dialogs[-1]
         field = next(c for c in walk(dialog) if isinstance(c, ft.TextField))
         save = next(c for c in walk(dialog) if isinstance(c, ft.FilledButton))
@@ -126,7 +126,7 @@ class ScreenTests(ScreenTestCase):
 
     def test_edit_button_needs_a_selected_client(self):
         self.build()
-        self.assertTrue(self.button("Set max HR").disabled)
+        self.assertTrue(self.button("Edit client").disabled)
 
     def test_new_client_form_accepts_and_validates_the_override(self):
         self.build()
