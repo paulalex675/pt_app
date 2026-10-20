@@ -5,6 +5,11 @@ Description: >
   items); a trainee points at its payer through payer_id. This stack never
   touches the invoicing table.
 
+Parameters:
+  InvoicingTableName:
+    Type: String
+    Description: Name of the existing invoicing table (the value of $INVOICING_TABLE). Only used to scope a read-only permission.
+
 Resources:
 
   # One item per person who trains. trainee_id is the SAME uuid PT Studio uses
@@ -55,8 +60,36 @@ Resources:
       KeySchema:
         - { AttributeName: trainee_id, KeyType: HASH }
 
+  # What PT Studio's sync is allowed to do - nothing more. Attach it to the
+  # pt-uploader permission set in IAM Identity Center as a customer managed policy
+  # named PtStudioSync. No delete (erasure is an admin action), and the invoicing
+  # table can only be queried inside the CUSTOMER partition: invoices, emails and
+  # the counter are unreadable and nothing there is writable.
+  SyncPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: PtStudioSync
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ClientTables
+            Effect: Allow
+            Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Scan]
+            Resource:
+              - !GetAtt TraineesTable.Arn
+              - !GetAtt HealthProfilesTable.Arn
+          - Sid: ReadPayersOnly
+            Effect: Allow
+            Action: dynamodb:Query
+            Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${InvoicingTableName}"
+            Condition:
+              ForAllValues:StringEquals:
+                "dynamodb:LeadingKeys": [CUSTOMER]
+
 Outputs:
   TraineesTableName:
     Value: !Ref TraineesTable
   HealthProfilesTableName:
     Value: !Ref HealthProfilesTable
+  SyncPolicyName:
+    Value: !Ref SyncPolicy
