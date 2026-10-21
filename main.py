@@ -16,6 +16,7 @@ import flet as ft
 import cloud_sync
 import db
 import elite
+import sounds
 import zones
 from ble_client import HeartRateStream, rr_to_json, scan_for_straps
 
@@ -107,6 +108,8 @@ def main(page: ft.Page):
     #page.window.height = 700
     page.padding = 0
     db.init_db()
+    sound_player = sounds.create_player()
+    strap_monitor = sounds.StrapMonitor()
 
     # ---------------- shared state ----------------
     state = {
@@ -125,6 +128,8 @@ def main(page: ft.Page):
         "pause_started": None,
         "paused_total": 0.0,
         "summary_session_id": None,   # the session shown on the Summary tab
+        "watchdog_gen": 0,            # lets a restarted session retire the old strap watchdog
+        "strap_warning": False,
     }
 
     def clock():
@@ -623,10 +628,31 @@ def main(page: ft.Page):
             control.color = zones.ZONE_COLORS[2]
         control.visible = True
 
+    def play_event_cues(events):
+        for event in events:
+            sound_player.play(sounds.cue_for_event(event.phase, event.round_no))
+
+    def play_work_state_cues(participant, events, now):
+        """Pause/resume of the zone-5 clock isn't a phase event, so watch the running flag change."""
+        engine = participant["engine"]
+        if engine.phase != elite.WORK:
+            participant["sound_running"] = None
+            return
+        running = engine.snapshot(now)["running"]
+        was_running = participant.get("sound_running")
+        if not any(event.phase == elite.WORK for event in events):      # entering WORK already had its cue
+            if was_running is True and not running:
+                sound_player.play(sounds.WORK_PAUSE)
+            elif was_running is False and running:
+                sound_player.play(sounds.WORK_RESUME)
+        participant["sound_running"] = running
+
     def handle_elite_sample(client_id, participant, hr, now):
         events = participant["engine"].update(now, hr)
         persist_elite(client_id, participant, events)
         render_elite_status(participant)
+        play_event_cues(events)
+        play_work_state_cues(participant, events, now)
         if events and all(p["engine"].done for p in state["participants"].values() if p.get("engine")):
             elapsed_text.value = "All rounds complete. Press End session to save."
 
@@ -634,6 +660,7 @@ def main(page: ft.Page):
         participant = state["participants"].get(client_id)
         if not participant:
             return
+        participant["heard_at"] = time.monotonic()
         recording = bool(state["session_id"]) and not state["paused"]
         if recording and not participant.get("max_hr_locked"):
             confirmed_max = zones.track_new_max(participant["max_streak"], hr, participant["max_hr"])
@@ -755,6 +782,29 @@ def main(page: ft.Page):
 
     device_picker.on_select = on_device_pick
 
+    async def strap_watchdog(generation):
+        """Once a second: has any strap gone quiet? Alert with sound and a red banner."""
+        while True:
+            await asyncio.sleep(1.0)
+            if not state["session_id"] or state["watchdog_gen"] != generation:
+                return
+            now = time.monotonic()
+            heard = {cid: p.get("heard_at") for cid, p in state["participants"].items()}
+            for _ in strap_monitor.check(now, heard):
+                sound_player.play(sounds.STRAP_LOST)
+            silent = [state["participants"][cid]["name"] for cid, last in heard.items()
+                      if last is not None and now - last > strap_monitor.timeout_s]
+            if silent:
+                live_status.value = "NO SIGNAL: " + ", ".join(silent)
+                live_status.color = zones.ZONE_COLORS[4]
+                state["strap_warning"] = True
+                page.update()
+            elif state["strap_warning"]:
+                state["strap_warning"] = False
+                live_status.value = "PAUSED - not recording" if state["paused"] else ""
+                live_status.color = zones.ZONE_COLORS[3]
+                page.update()
+
     def launch_session(mode, settings):
         """Creates the session and its engines, then switches to the full-screen live view."""
         state["paused"] = False
@@ -802,8 +852,17 @@ def main(page: ft.Page):
                     line = ft.Container(top=0, width=2, height=34, bgcolor=colour)
                     participant["bar_stack"].controls.append(line)
                     participant["elite_markers"].append((line, bpm))
-                persist_elite(participant["client_id"], participant, engine.pop_events() or [])
+                launch_events = engine.pop_events() or []
+                persist_elite(participant["client_id"], participant, launch_events)
                 render_elite_status(participant)
+                participant["sound_running"] = None
+                play_event_cues(launch_events)                       # "get ready" as the session starts
+        for participant in state["participants"].values():
+            participant["heard_at"] = time.monotonic()               # a strap that never speaks is caught too
+        strap_monitor.reset()
+        state["strap_warning"] = False
+        state["watchdog_gen"] += 1
+        page.run_task(strap_watchdog, state["watchdog_gen"])
         start_session_error.visible = False
         pause_btn.content = "Pause"
         pause_btn.icon = ft.Icons.PAUSE
@@ -1072,8 +1131,45 @@ def main(page: ft.Page):
     pause_btn = ft.FilledTonalButton("Pause", icon=ft.Icons.PAUSE, on_click=toggle_pause)
     restart_btn = ft.OutlinedButton("Restart", icon=ft.Icons.RESTART_ALT, on_click=confirm_restart)
     live_status = ft.Text("", size=18, weight=ft.FontWeight.BOLD, color=zones.ZONE_COLORS[3])
+    # ---- sound: on/off, volume, test; a mute button stays available during a live session ----
+    sound_note = ft.Text("" if sound_player.available else sound_player.status, size=12, color=ft.Colors.ORANGE_300)
+
+    def refresh_sound_controls():
+        sound_switch.value = sound_player.enabled
+        volume_slider.value = sound_player.volume
+        mute_btn.icon = ft.Icons.VOLUME_UP if sound_player.enabled and sound_player.volume > 0 else ft.Icons.VOLUME_OFF
+        for control in (sound_switch, volume_slider, test_sound_btn, mute_btn):
+            control.disabled = not sound_player.available
+
+    def on_sound_switch(e):
+        sound_player.set_enabled(e.control.value)
+        refresh_sound_controls()
+        page.update()
+
+    def on_volume(e):
+        sound_player.set_volume(e.control.value)
+        refresh_sound_controls()
+        page.update()
+
+    def on_test_sound(e):
+        sound_player.play(sounds.WORK_START, force=True)
+
+    def on_mute_toggle(e):
+        sound_player.set_enabled(not sound_player.enabled)
+        refresh_sound_controls()
+        page.update()
+
+    sound_switch = ft.Switch(label="Sounds", value=sound_player.enabled, on_change=on_sound_switch)
+    volume_slider = ft.Slider(min=0, max=1, divisions=10, value=sound_player.volume, width=180,
+                              on_change=on_volume, label="{value}")
+    test_sound_btn = ft.OutlinedButton("Test sound", icon=ft.Icons.PLAY_CIRCLE, on_click=on_test_sound)
+    mute_btn = ft.IconButton(icon=ft.Icons.VOLUME_UP, tooltip="Mute / unmute sounds", on_click=on_mute_toggle)
+    sound_row = ft.Row([sound_switch, volume_slider, test_sound_btn, sound_note],
+                       alignment=ft.MainAxisAlignment.START, spacing=16, key="sound-row")
+    refresh_sound_controls()
+
     live_controls = ft.Row(
-        [pause_btn, stop_btn, restart_btn, elapsed_text, live_status],
+        [pause_btn, stop_btn, restart_btn, mute_btn, elapsed_text, live_status],
         alignment=ft.MainAxisAlignment.CENTER, spacing=20, visible=False, key="live-controls",
     )
     setup_buttons_row = ft.Row([start_btn], alignment=ft.MainAxisAlignment.CENTER, key="setup-buttons")
@@ -1083,6 +1179,7 @@ def main(page: ft.Page):
             ft.Row([mode_picker]),
             elite_settings_row,
             elite_hint,
+            sound_row,
             ft.Text("Add participants", weight=ft.FontWeight.BOLD),
             ft.Row([client_picker, device_picker], alignment=ft.MainAxisAlignment.START),
             ft.Row([scan_btn], alignment=ft.MainAxisAlignment.START),

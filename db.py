@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS clients (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS payers_cache (
     id TEXT PRIMARY KEY,       -- invoicing CUSTOMER sk
     name TEXT NOT NULL,
@@ -217,6 +222,20 @@ def set_client_payer(client_id: str, payer_id: str | None) -> None:
     with get_conn() as conn:
         conn.execute("UPDATE clients SET payer_id = ?, updated_at = ? WHERE id = ?",
                      (payer_id or None, _now(), client_id))
+
+
+# ---------- app settings (per machine; not synced) ----------
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_conn() as conn:
+        conn.execute("INSERT INTO app_settings (key, value) VALUES (?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, str(value)))
 
 
 # ---------- payers (read-only copy of the invoicing CUSTOMER items) ----------

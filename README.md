@@ -100,6 +100,35 @@ Then:
 3. End a session, open the **Summary** tab, press **Export to cloud**, then open
    `dashboard/index.html`.
 
+## Sounds
+
+Elite sessions play audio cues so you can train without watching the screen:
+
+| Cue | When |
+| --- | --- |
+| session start | the session begins - get above your zone 5 line |
+| work start | zone 5 reached, the round clock is running |
+| work pause / resume | you drop out of / return to zone 5 |
+| round end | round complete - rest until recovered |
+| recovered | recovered, next round starts |
+| final bell | all rounds complete (not played if you press Stop) |
+| strap lost | a strap has sent nothing for 5 s (repeats every 10 s; also shows a red "NO SIGNAL" banner) |
+
+The strap alert works in normal sessions too. There is a Sounds switch, volume slider and
+Test sound button on the Session tab, and a mute button on the live screen. Settings are
+remembered per machine.
+
+With several clients, cues are shared: the same cue is never repeated within 1.5 seconds, so
+five fighters reaching zone 5 together give one "go". The strap alert is never held back.
+
+Playback uses `pygame` (in `requirements.txt`; run `python -m pip install -r requirements.txt`).
+If it is missing or the machine has no audio output the app stays silent and says why.
+
+Hear them first: open `sounds/preview.html` in a browser (after `python tools/make_sounds.py`),
+or on the machine itself run `python tools/preview_sounds.py`. The sounds are synthesised by
+`tools/make_sounds.py` (needs `numpy`; the app does not), so there is nothing to license and you
+can retune pitch, length or loudness there and regenerate.
+
 ## Client database and cloud sync
 
 PT Studio always works from its local `pt_studio.db`, so a session never waits on the
@@ -220,6 +249,7 @@ what gets deployed or tested.
 ```
 main.py  elite.py  db.py  export.py  zones.py  ble_client.py       the desktop app
 cloud_sync.py                                                        client list sync (offline-first)
+sounds.py  sounds/*.wav                                              audio cues (tools/make_sounds.py makes the files)
 tools/propose_links.py                                               read-only payer-link suggestions
 lambda/silver_transform.py  lambda/api_summary.py                    what `sam deploy` ships
 infra/template.yaml                                                  data pipeline stack (samconfig.toml stays local)

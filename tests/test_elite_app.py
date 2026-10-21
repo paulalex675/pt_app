@@ -47,6 +47,7 @@ class FakePage:
         self.window = FakeWindow()
         self.controls = []
         self.dialogs = []
+        self.tasks = []
         self.width = 1400
         self.height = 900
 
@@ -61,6 +62,9 @@ class FakePage:
 
     def pop_dialog(self):
         pass
+
+    def run_task(self, handler, *args, **kwargs):
+        self.tasks.append((handler, args))
 
 
 class FakeClock:

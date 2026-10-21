@@ -25,3 +25,4 @@ infra/samconfig.toml
 
 # local copy of the dashboard with real client ids
 dashboard/*.local.html
+sounds/preview.html
