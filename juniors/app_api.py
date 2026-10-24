@@ -212,9 +212,23 @@ def list_trainees(_event, _params):
     for t in _scan_all(trainees):
         h = profiles.get(t["trainee_id"], {})
         rows = _query_all(consents, t["trainee_id"]) if h.get("dob") else None
-        out.append(_summary(t, h, payers, rows))
+        summary = _summary(t, h, payers, rows)
+        if summary["is_junior"]:
+            summary["latest_measurement"] = _latest_measurement(t["trainee_id"])
+        out.append(summary)
     out.sort(key=lambda s: (not s["is_junior"], s["last_name"].lower(), s["first_name"].lower()))
     return 200, out
+
+
+def _latest_measurement(tid: str) -> dict | None:
+    """Newest measurement, for the stage chip on the list. Sort keys start with the
+    date, and "PROFILE" sorts after any date, so read newest-first and skip it."""
+    page = measurements.query(KeyConditionExpression=Key("trainee_id").eq(tid),
+                              ScanIndexForward=False, Limit=2)
+    latest = next((g for g in page["Items"] if g["sk"] != PROFILE_SK), None)
+    if not latest:
+        return None
+    return {k: latest.get(k) for k in ("measured_on", "stage", "growth_cm_per_month", "flags")}
 
 
 def _trainee_fields(body: dict, payers: dict) -> tuple[dict, dict]:

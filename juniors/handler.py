@@ -146,10 +146,15 @@ def measurement_handler(event, context):
         Measurement(date.fromisoformat(m["measured_on"]), float(m["height_cm"]),
                     _float(m.get("sitting_height_cm")), _float(m.get("weight_kg")))
         for m in _query_all(measurements, trainee_id)
-        if m["sk"] != PROFILE_SK
+        if m["sk"] != PROFILE_SK and m["measured_on"] != measured_on.isoformat()
     ]
     # Khamis-Roche %PAH plugs in here once implemented (needs mid_parent_height_cm).
     result = assess(sex, dob, current, history, percent_pah=None)
+
+    # One entry per day: re-measuring on the same date replaces it (fixes typos).
+    for m in _query_all(measurements, trainee_id):
+        if m["sk"].startswith(f"{measured_on.isoformat()}#"):
+            measurements.delete_item(Key={"trainee_id": trainee_id, "sk": m["sk"]})
 
     measurement_id = str(uuid.uuid4())
     item = {

@@ -160,3 +160,19 @@ def test_missing_dob_or_other_sex_422(h):
         Item={"trainee_id": "t2", "dob": "2013-05-01", "sex": "other"})
     status, body = call(handler.measurement_handler, {**MEASURE, "trainee_id": "t2"})
     assert status == 422 and "male or female" in body["error"]
+
+
+def test_same_day_measurement_replaces_earlier_entry(h):
+    handler, ddb = h
+    token = send_link(ddb)
+    call(handler.consent_submit_handler, {
+        "token": token, "given_by": "Jane", "relationship": "mother",
+        "granted": ["growth_measurements"]})
+    assert call(handler.measurement_handler, {**MEASURE, "height_cm": 106.0, "sitting_height_cm": None})[0] == 201  # typo
+    status, _ = call(handler.measurement_handler, MEASURE)
+    assert status == 201
+    from boto3.dynamodb.conditions import Key
+    items = ddb.Table("pt-growth-measurements").query(
+        KeyConditionExpression=Key("trainee_id").eq("t1"))["Items"]
+    rows = [i for i in items if i["sk"] != "PROFILE"]
+    assert len(rows) == 1 and float(rows[0]["height_cm"]) == 160.0

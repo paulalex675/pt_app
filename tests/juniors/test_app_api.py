@@ -221,3 +221,22 @@ def test_unknown_route_and_trainee(env):
     api, *_ = env
     assert call(api, "DELETE /juniors/trainees/{id}", id="x")[0] == 404
     assert call(api, "GET /juniors/trainees/{id}", id="nobody")[0] == 404
+
+
+def test_list_shows_latest_measurement_for_juniors(env):
+    api, handler, _, mail = env
+    tid = call(api, "POST /juniors/trainees", JUNIOR)[1]["id"]
+    call(api, "POST /juniors/trainees", {**JUNIOR, "first_name": "Adult", "dob": "1990-01-01"})
+    assert call(api, "GET /juniors/trainees")[1][0]["latest_measurement"] is None
+    _grant(api, handler, tid, mail)
+    for days_ago, height in ((31, 148.0), (0, 149.0)):
+        on = (date.today() - timedelta(days=days_ago)).isoformat()
+        handler.measurement_handler({"body": json.dumps(
+            {"trainee_id": tid, "measured_on": on, "height_cm": height})}, None)
+    juniors = [t for t in call(api, "GET /juniors/trainees")[1] if t["is_junior"]]
+    adults = [t for t in call(api, "GET /juniors/trainees")[1] if not t["is_junior"]]
+    latest = juniors[0]["latest_measurement"]
+    assert latest["measured_on"] == date.today().isoformat()
+    assert latest["stage"] in ("pre_phv", "circa_phv", "post_phv")
+    assert latest["growth_cm_per_month"] is not None
+    assert "latest_measurement" not in adults[0]
