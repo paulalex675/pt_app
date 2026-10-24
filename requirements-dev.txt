@@ -1,3 +1,4 @@
 -r requirements.txt
-moto[s3,dynamodb]>=5.0
+moto[s3,dynamodb,events,sqs]>=5.0
+pytest>=8.0
 numpy>=1.26

@@ -10,6 +10,7 @@ This folder is the whole Lambda package; its tests live in `tests/juniors/`.
 | `maturity.py` | Pure maths: decimal age, junior check, Moore 2015 and Mirwald 2002 maturity offset, mid-parent height, growth velocity, PHV stage |
 | `consent.py` | Consent rules: active consent per type, status panel, building rows, single-use link tokens |
 | `handler.py` | Lambdas: record a measurement, parent consent submit, withdraw consent |
+| `app_api.py` | Trainer app API: trainees, payers, consent requests, growth summaries; public consent-page lookup |
 
 Infrastructure is in the existing templates:
 
@@ -47,11 +48,35 @@ PT Studio's `PtStudioSync` policy has no access to the junior tables.
 
 ## API
 
-| Route | Who | Auth |
+Base URL: the `JuniorsApiUrl` stack output.
+
+| Route | Who | What |
 | --- | --- | --- |
-| `POST /juniors/measurements` | trainer | Cognito login (invoicing user pool) |
-| `POST /juniors/consent/withdraw` | trainer | Cognito login |
-| `POST /juniors/consent` | parent | none — the single-use token in the link is the authorisation |
+| `GET /juniors/payers` | trainer | Bill payers from invoicing (their email is the guardian contact) |
+| `GET /juniors/trainees` | trainer | Everyone, juniors first, with consent status |
+| `POST /juniors/trainees` | trainer | Create a trainee + health profile |
+| `GET /juniors/trainees/{id}` | trainer | Profile, consent status and log, open consent links, measurements |
+| `PUT /juniors/trainees/{id}` | trainer | Edit any of: names, payer, dob, sex, height, weight |
+| `POST /juniors/trainees/{id}/consent-request` | trainer | Email a consent link to the payer |
+| `POST /juniors/trainees/{id}/growth-summary` | trainer | Email the growth table to the payer (optional `note`) |
+| `POST /juniors/measurements` | trainer | Record a measurement (needs growth consent) |
+| `POST /juniors/consent/withdraw` | trainer | Withdraw one consent type |
+| `POST /juniors/consent/lookup` | parent | What the consent page shows (token in body) |
+| `POST /juniors/consent` | parent | Submit consent (token in body) |
+
+Trainer routes need the invoicing Cognito login. Parent routes are public; the
+single-use token from the emailed link is the authorisation. The link carries the
+token after `#`, so it never reaches server logs.
+
+**Same data as PT Studio.** Trainees and health profiles are the `pt-trainees` /
+`pt-health-profiles` items PT Studio syncs, with the same `updated_at` format, so an
+edit on the phone shows up in PT Studio at its next sync and vice versa (newest edit
+wins). Edits only touch the fields sent, so max HR and resting HR are left alone.
+
+**Emails** go through the invoicing mailer (`email.requested` on the `pt-events` bus)
+using the `junior_consent_request` and `junior_growth_summary` templates in the
+invoicing repo, BCC'd to `OwnerEmail`. Until `ConsentPageUrl` is set, a consent
+request isn't emailed: the API returns the link so you can test it yourself.
 
 ## Deploy (Git Bash)
 
@@ -71,8 +96,9 @@ aws cognito-idp list-user-pools --max-results 10 --profile pt --region eu-west-2
 aws cognito-idp list-user-pool-clients --user-pool-id <pool id> --profile pt --region eu-west-2
 ```
 
-3. Lambdas and API. `--guided` asks for the three new parameters and saves them
-   to `samconfig.toml`; accept the other saved answers:
+3. Lambdas and API. `--guided` asks for any new parameters (Cognito IDs,
+   `InvoicingTableName`, `OwnerEmail`, `ConsentPageUrl`) and saves them to
+   `samconfig.toml`; accept the other saved answers:
 
 ```bash
 sam build
