@@ -99,8 +99,16 @@ Resources:
         SSEEnabled: true
       AttributeDefinitions:
         - { AttributeName: token_hash, AttributeType: S }
+        - { AttributeName: trainee_id, AttributeType: S }
       KeySchema:
         - { AttributeName: token_hash, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by_trainee        # "links sent for this child that are still open"
+          KeySchema:
+            - { AttributeName: trainee_id, KeyType: HASH }
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [sent_at, sent_to, expires_at]
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true

@@ -23,6 +23,20 @@ Parameters:
     Description: >
       Origin allowed to call the juniors API from a browser. Leave "*" while building
       the consent app; set it to the app's https URL once it's hosted.
+  InvoicingTableName:
+    Type: String
+    Description: >
+      The invoicing DynamoDB table (value of $INVOICING_TABLE). The juniors app only
+      reads the CUSTOMER items from it - bill payers, whose email is the guardian contact.
+  OwnerEmail:
+    Type: String
+    Description: Your email - BCC'd on consent requests and growth summaries.
+  ConsentPageUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Public URL of the parent consent page. Leave blank until it's hosted: consent
+      requests then return the link to the app instead of emailing it.
 
 Resources:
 
@@ -102,9 +116,13 @@ Resources:
   JuniorsApi:
     Type: AWS::Serverless::HttpApi
     Properties:
+      # Two routes are public (consent page), so cap the rate like the invoicing API.
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 20
       CorsConfiguration:
         AllowOrigins: [!Ref JuniorsAllowedOrigin]
-        AllowMethods: [POST, OPTIONS]
+        AllowMethods: [GET, POST, PUT, OPTIONS]
         AllowHeaders: [authorization, content-type]
       Auth:
         DefaultAuthorizer: CognitoJwt
@@ -218,6 +236,84 @@ Resources:
             ApiId: !Ref JuniorsApi
             Path: /juniors/consent/withdraw
             Method: post
+
+  # Trainer app API: trainees, payers, consent requests, growth summaries; plus the
+  # public consent-page lookup. Emails go via the invoicing mailer (pt-events bus).
+  JuniorsAppFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app_api.handler
+      CodeUri: ../juniors/
+      Runtime: python3.12
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TRAINEES_TABLE: pt-trainees
+          HEALTH_TABLE: pt-health-profiles
+          CONSENTS_TABLE: pt-junior-consents
+          CONSENT_REQUESTS_TABLE: pt-junior-consent-requests
+          MEASUREMENTS_TABLE: pt-growth-measurements
+          INVOICING_TABLE: !Ref InvoicingTableName
+          EVENT_BUS: pt-events
+          OWNER_EMAIL: !Ref OwnerEmail
+          CONSENT_PAGE_URL: !Ref ConsentPageUrl
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Scan]
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-trainees"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-health-profiles"
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-junior-consents"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-growth-measurements"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-junior-consent-requests/index/by_trainee"
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:PutItem]
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-junior-consent-requests"
+            - Sid: ReadPayersOnly
+              Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${InvoicingTableName}"
+              Condition:
+                ForAllValues:StringEquals:
+                  "dynamodb:LeadingKeys": [CUSTOMER]
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/pt-events"
+      Events:
+        Payers:
+          Type: HttpApi
+          Properties: { ApiId: !Ref JuniorsApi, Path: /juniors/payers, Method: get }
+        ListTrainees:
+          Type: HttpApi
+          Properties: { ApiId: !Ref JuniorsApi, Path: /juniors/trainees, Method: get }
+        CreateTrainee:
+          Type: HttpApi
+          Properties: { ApiId: !Ref JuniorsApi, Path: /juniors/trainees, Method: post }
+        GetTrainee:
+          Type: HttpApi
+          Properties: { ApiId: !Ref JuniorsApi, Path: "/juniors/trainees/{id}", Method: get }
+        UpdateTrainee:
+          Type: HttpApi
+          Properties: { ApiId: !Ref JuniorsApi, Path: "/juniors/trainees/{id}", Method: put }
+        ConsentRequest:
+          Type: HttpApi
+          Properties: { ApiId: !Ref JuniorsApi, Path: "/juniors/trainees/{id}/consent-request", Method: post }
+        GrowthSummary:
+          Type: HttpApi
+          Properties: { ApiId: !Ref JuniorsApi, Path: "/juniors/trainees/{id}/growth-summary", Method: post }
+        ConsentLookup:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JuniorsApi
+            Path: /juniors/consent/lookup
+            Method: post
+            Auth:
+              Authorizer: NONE
 
 Outputs:
   BucketName:
