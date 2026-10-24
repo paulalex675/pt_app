@@ -160,7 +160,7 @@ Resources:
               Action: dynamodb:Query
               Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-junior-consents"
             - Effect: Allow
-              Action: [dynamodb:Query, dynamodb:PutItem]
+              Action: [dynamodb:Query, dynamodb:PutItem, dynamodb:DeleteItem]
               Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-growth-measurements"
       Events:
         Measure:
