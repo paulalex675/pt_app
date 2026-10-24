@@ -22,6 +22,7 @@ import db
 
 DEFAULT_REGION = "eu-west-2"
 DEFAULT_HEALTH_TABLE = "pt-health-profiles"
+DEFAULT_GROWTH_TABLE = "pt-growth-measurements"
 
 
 @dataclass
@@ -208,7 +209,33 @@ def sync(dynamodb=None) -> SyncResult:
 
 
 def delete_trainee(client_id: str, dynamodb=None) -> None:
-    """GDPR erasure for the cloud tables (export.delete_client_data covers the S3 data)."""
+    """GDPR erasure for the cloud tables (export.delete_client_data covers the S3 data).
+
+    Also removes a junior's growth measurements and mid-parent height. The junior
+    consent log (pt-junior-consents) is kept as evidence of what was agreed; how
+    long to keep it is still an open retention decision.
+    """
     dynamodb = dynamodb or _resource()
     dynamodb.Table(os.environ.get("PT_TRAINEES_TABLE", "pt-trainees")).delete_item(Key={"trainee_id": client_id})
     dynamodb.Table(os.environ.get("PT_HEALTH_TABLE", DEFAULT_HEALTH_TABLE)).delete_item(Key={"trainee_id": client_id})
+    _delete_partition(dynamodb.Table(os.environ.get("PT_GROWTH_TABLE", DEFAULT_GROWTH_TABLE)), client_id)
+
+
+def _delete_partition(table, client_id: str) -> None:
+    """Delete every item for one trainee. A missing table (juniors not deployed) is fine."""
+    from boto3.dynamodb.conditions import Key
+    from botocore.exceptions import ClientError
+    kwargs = {"KeyConditionExpression": Key("trainee_id").eq(client_id),
+              "ProjectionExpression": "trainee_id, sk"}
+    try:
+        with table.batch_writer() as batch:
+            while True:
+                page = table.query(**kwargs)
+                for item in page["Items"]:
+                    batch.delete_item(Key={"trainee_id": item["trainee_id"], "sk": item["sk"]})
+                if "LastEvaluatedKey" not in page:
+                    return
+                kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] != "ResourceNotFoundException":
+            raise

@@ -9,6 +9,20 @@ Parameters:
   BucketNameSuffix:
     Type: String
     Description: Appended to the bucket name to keep it globally unique, e.g. your initials or account id.
+  CognitoUserPoolId:
+    Type: String
+    Description: >
+      User pool ID from the invoicing stack (e.g. eu-west-2_AbC123). The juniors
+      trainer routes accept the same login as the invoicing app.
+  CognitoAppClientId:
+    Type: String
+    Description: App client ID from the invoicing stack's user pool.
+  JuniorsAllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: >
+      Origin allowed to call the juniors API from a browser. Leave "*" while building
+      the consent app; set it to the app's https URL once it's hosted.
 
 Resources:
 
@@ -79,6 +93,132 @@ Resources:
             Path: /clients/{client_id}/summary
             Method: get
 
+  # ---------------- Juniors: consent and growth measurements ----------------
+  # Own API so the existing dashboard API (and its URL) is untouched. Trainer
+  # routes need a Cognito login (same user pool as invoicing); the parent consent
+  # route is public because the single-use emailed token is its authorisation.
+  # Tables live in clients-stack.yaml - deploy that first.
+
+  JuniorsApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: [!Ref JuniorsAllowedOrigin]
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [authorization, content-type]
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}"
+              audience: [!Ref CognitoAppClientId]
+
+  # The juniors/ folder is the whole deployment package (tests live in tests/juniors).
+  JuniorMeasurementFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handler.measurement_handler
+      CodeUri: ../juniors/
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TRAINEES_TABLE: pt-trainees
+          HEALTH_TABLE: pt-health-profiles
+          CONSENTS_TABLE: pt-junior-consents
+          CONSENT_REQUESTS_TABLE: pt-junior-consent-requests
+          MEASUREMENTS_TABLE: pt-growth-measurements
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:GetItem
+              Resource:
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-trainees"
+                - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-health-profiles"
+            - Effect: Allow
+              Action: dynamodb:Query
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-junior-consents"
+            - Effect: Allow
+              Action: [dynamodb:Query, dynamodb:PutItem]
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-growth-measurements"
+      Events:
+        Measure:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JuniorsApi
+            Path: /juniors/measurements
+            Method: post
+
+  JuniorConsentSubmitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handler.consent_submit_handler
+      CodeUri: ../juniors/
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TRAINEES_TABLE: pt-trainees
+          HEALTH_TABLE: pt-health-profiles
+          CONSENTS_TABLE: pt-junior-consents
+          CONSENT_REQUESTS_TABLE: pt-junior-consent-requests
+          MEASUREMENTS_TABLE: pt-growth-measurements
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:DeleteItem]
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-junior-consent-requests"
+            - Effect: Allow
+              Action: [dynamodb:PutItem, dynamodb:BatchWriteItem]
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-junior-consents"
+            - Effect: Allow
+              Action: dynamodb:PutItem      # mid-parent height PROFILE item only
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-growth-measurements"
+              Condition:
+                ForAllValues:StringEquals:
+                  "dynamodb:Attributes": [trainee_id, sk, mid_parent_height_cm, updated_at]
+      Events:
+        Submit:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JuniorsApi
+            Path: /juniors/consent
+            Method: post
+            Auth:
+              Authorizer: NONE
+
+  JuniorConsentWithdrawFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handler.consent_withdraw_handler
+      CodeUri: ../juniors/
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TRAINEES_TABLE: pt-trainees
+          HEALTH_TABLE: pt-health-profiles
+          CONSENTS_TABLE: pt-junior-consents
+          CONSENT_REQUESTS_TABLE: pt-junior-consent-requests
+          MEASUREMENTS_TABLE: pt-growth-measurements
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:Query, dynamodb:UpdateItem]
+              Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/pt-junior-consents"
+      Events:
+        Withdraw:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref JuniorsApi
+            Path: /juniors/consent/withdraw
+            Method: post
+
 Outputs:
   BucketName:
     Description: S3 bucket for bronze/silver/gold session data. Set this as S3_BUCKET in main.py.
@@ -88,3 +228,6 @@ Outputs:
       Base URL of the dashboard API. The summary endpoint is
       {ApiUrl}/clients/{client_id}/summary — set this as the API base in dashboard/index.html.
     Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  JuniorsApiUrl:
+    Description: Base URL for the juniors consent and measurement routes (/juniors/...).
+    Value: !Sub "https://${JuniorsApi}.execute-api.${AWS::Region}.amazonaws.com"

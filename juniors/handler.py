@@ -1,14 +1,20 @@
 """Lambda handlers for junior consent and growth measurements.
 
 Environment variables
-    TRAINEES_TABLE          existing shared trainee table (partition key: trainee_id)
-    CONSENTS_TABLE          JuniorConsents
-    CONSENT_REQUESTS_TABLE  JuniorConsentRequests
-    MEASUREMENTS_TABLE      GrowthMeasurements
+    TRAINEES_TABLE          pt-trainees (existence check only)
+    HEALTH_TABLE            pt-health-profiles (dob and sex, as PT Studio syncs them)
+    CONSENTS_TABLE          pt-junior-consents
+    CONSENT_REQUESTS_TABLE  pt-junior-consent-requests
+    MEASUREMENTS_TABLE      pt-growth-measurements
 
-Trainee records need two new attributes: date_of_birth ("YYYY-MM-DD") and
-sex ("male" | "female", used only by the maturity equations). Mid-parent height
-is written to the trainee record by the consent handler.
+Date of birth and sex come from the health profile PT Studio already syncs
+("dob" as YYYY-MM-DD, "sex" as male/female/other; the maturity equations only
+exist for male and female).
+
+Mid-parent height is NOT written to the health profile: PT Studio's sync
+replaces that whole item on every push, which would wipe it. It is kept in
+pt-growth-measurements under sk "PROFILE", so all of a junior's growth data
+sits in one partition and erasing it is one query-and-delete.
 
 Routes (API Gateway HTTP API, Lambda proxy):
     POST /juniors/measurements        measurement_handler     (trainer, Cognito)
@@ -28,19 +34,23 @@ from decimal import Decimal
 import boto3
 from boto3.dynamodb.conditions import Key
 
-from .consent import (
-    ConsentError,
-    build_consent_rows,
-    hash_token,
-    require,
-)
-from .maturity import Measurement, assess, is_junior, mid_parent_height
+try:
+    from .consent import ConsentError, build_consent_rows, hash_token, require
+    from .maturity import Measurement, assess, is_junior, mid_parent_height
+except ImportError:  # deployed: juniors/ is the Lambda root, so modules sit flat
+    from consent import ConsentError, build_consent_rows, hash_token, require
+    from maturity import Measurement, assess, is_junior, mid_parent_height
 
 _ddb = boto3.resource("dynamodb")
-trainees = _ddb.Table(os.environ.get("TRAINEES_TABLE", "Trainees"))
-consents = _ddb.Table(os.environ.get("CONSENTS_TABLE", "JuniorConsents"))
-requests = _ddb.Table(os.environ.get("CONSENT_REQUESTS_TABLE", "JuniorConsentRequests"))
-measurements = _ddb.Table(os.environ.get("MEASUREMENTS_TABLE", "GrowthMeasurements"))
+trainees = _ddb.Table(os.environ.get("TRAINEES_TABLE", "pt-trainees"))
+health = _ddb.Table(os.environ.get("HEALTH_TABLE", "pt-health-profiles"))
+consents = _ddb.Table(os.environ.get("CONSENTS_TABLE", "pt-junior-consents"))
+requests = _ddb.Table(os.environ.get("CONSENT_REQUESTS_TABLE", "pt-junior-consent-requests"))
+measurements = _ddb.Table(os.environ.get("MEASUREMENTS_TABLE", "pt-growth-measurements"))
+
+# Per-junior growth profile item (mid-parent height) in the measurements table.
+# Measurement sort keys start with an ISO date, so they never collide with it.
+PROFILE_SK = "PROFILE"
 
 
 # ---------- helpers ----------
@@ -97,13 +107,16 @@ def measurement_handler(event, context):
     if not trainee_id:
         return _resp(400, {"error": "trainee_id is required"})
 
-    trainee = trainees.get_item(Key={"trainee_id": trainee_id}).get("Item")
-    if not trainee:
+    if not trainees.get_item(Key={"trainee_id": trainee_id}).get("Item"):
         return _resp(404, {"error": "trainee not found"})
-    if not trainee.get("date_of_birth") or trainee.get("sex") not in ("male", "female"):
-        return _resp(422, {"error": "trainee needs date_of_birth and sex first"})
+    profile = health.get_item(Key={"trainee_id": trainee_id}).get("Item") or {}
+    if not profile.get("dob"):
+        return _resp(422, {"error": "add the trainee's date of birth in PT Studio first"})
+    if profile.get("sex") not in ("male", "female"):
+        return _resp(422, {"error": "maturity estimates need sex set to male or female in PT Studio"})
+    sex = profile["sex"]
 
-    dob = date.fromisoformat(trainee["date_of_birth"])
+    dob = date.fromisoformat(profile["dob"])
     measured_on = date.fromisoformat(b.get("measured_on") or date.today().isoformat())
     if not is_junior(dob, measured_on):
         return _resp(422, {"error": "growth tracking is for under-18s only"})
@@ -133,9 +146,10 @@ def measurement_handler(event, context):
         Measurement(date.fromisoformat(m["measured_on"]), float(m["height_cm"]),
                     _float(m.get("sitting_height_cm")), _float(m.get("weight_kg")))
         for m in _query_all(measurements, trainee_id)
+        if m["sk"] != PROFILE_SK
     ]
     # Khamis-Roche %PAH plugs in here once implemented (needs mid_parent_height_cm).
-    result = assess(trainee["sex"], dob, current, history, percent_pah=None)
+    result = assess(sex, dob, current, history, percent_pah=None)
 
     measurement_id = str(uuid.uuid4())
     item = {
@@ -190,11 +204,12 @@ def consent_submit_handler(event, context):
 
     # Store only the mid-parent average; the two raw heights are never saved.
     if mph is not None and "growth_measurements" in b.get("granted", []):
-        trainees.update_item(
-            Key={"trainee_id": trainee_id},
-            UpdateExpression="SET mid_parent_height_cm = :m",
-            ExpressionAttributeValues={":m": Decimal(str(mph))},
-        )
+        measurements.put_item(Item={
+            "trainee_id": trainee_id,
+            "sk": PROFILE_SK,
+            "mid_parent_height_cm": Decimal(str(mph)),
+            "updated_at": now.isoformat(timespec="seconds"),
+        })
 
     # Single use: remove the link once submitted.
     requests.delete_item(Key={"token_hash": req["token_hash"]})

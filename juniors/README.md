@@ -1,7 +1,7 @@
 # Junior growth tracking
 
-Consent log, growth measurements and maturity estimates for under-18 trainees.
-Lives in the same repo and CDK stack as the shared trainee table, so no new repo.
+Consent log, monthly growth measurements and maturity estimates for under-18 trainees.
+This folder is the whole Lambda package; its tests live in `tests/juniors/`.
 
 ## What's here
 
@@ -10,20 +10,26 @@ Lives in the same repo and CDK stack as the shared trainee table, so no new repo
 | `maturity.py` | Pure maths: decimal age, junior check, Moore 2015 and Mirwald 2002 maturity offset, mid-parent height, growth velocity, PHV stage |
 | `consent.py` | Consent rules: active consent per type, status panel, building rows, single-use link tokens |
 | `handler.py` | Lambdas: record a measurement, parent consent submit, withdraw consent |
-| `juniors_construct.py` | CDK construct: 3 DynamoDB tables + 3 Lambdas with least-privilege grants |
-| `tests/` | 32 tests, including a full consent → measure → withdraw flow on mocked DynamoDB |
+
+Infrastructure is in the existing templates:
+
+- **Tables** → `infra/clients-stack.yaml`, next to `pt-trainees` and `pt-health-profiles`.
+- **Lambdas + API** → `infra/template.yaml`, on their own `JuniorsApi` so the dashboard API is untouched.
 
 ## Tables
 
 | Table | Keys | Holds |
 | --- | --- | --- |
-| `JuniorConsents` | `trainee_id` / `sk` = `<type>#<granted_at>` | Append-only consent log; withdrawal stamps `withdrawn_at` |
-| `JuniorConsentRequests` | `token_hash` | Single-use emailed links, SHA-256 hashed, TTL 14 days |
-| `GrowthMeasurements` | `trainee_id` / `sk` = `<date>#<id>` | Raw measurements plus the calculated results and `algorithm_version` |
+| `pt-junior-consents` | `trainee_id` / `sk` = `<type>#<granted_at>` | Append-only consent log; withdrawal stamps `withdrawn_at` |
+| `pt-junior-consent-requests` | `token_hash` | Single-use emailed links, SHA-256 hashed, TTL 14 days |
+| `pt-growth-measurements` | `trainee_id` / `sk` = `<date>#<id>` | Measurements plus calculated results and `algorithm_version`; one `sk = PROFILE` item per junior holds mid-parent height |
 
-Existing trainee records need two new attributes: `date_of_birth` (`YYYY-MM-DD`)
-and `sex` (`male` / `female`, used only by the equations). The consent handler
-adds `mid_parent_height_cm`; the two raw parent heights are never stored.
+Date of birth and sex come from `pt-health-profiles` (`dob`, `sex`), which PT Studio
+already syncs, so there's nothing extra to enter. Mid-parent height is kept in the
+growth table rather than the health profile because PT Studio's sync replaces the
+whole health item on each push. The two raw parent heights are never stored.
+
+PT Studio's `PtStudioSync` policy has no access to the junior tables.
 
 ## Rules built in
 
@@ -32,42 +38,63 @@ adds `mid_parent_height_cm`; the two raw parent heights are never stored.
 - Consent counts only if it's on the current wording (`CURRENT_CONSENT_VERSION`).
   Bump that string when the form text changes and everyone shows "expired".
 - Parent consent stops counting at 18; the athlete must then consent as `self`.
+- Growth rate is only calculated against a visit at least 28 days earlier (suits monthly measuring).
 - Growth over 0.6 cm/month flags `rapid_growth` and moves a pre-PHV child to circa-PHV.
-- Maturity offset is flagged unreliable for boys outside 11–16 and girls outside 9–15.
+- Maturity offset is flagged unreliable for boys outside 11–16 and girls outside 9–15,
+  and needs sex set to male or female in PT Studio.
+- `cloud_sync.delete_trainee()` now also erases the junior's growth data. The consent
+  log is kept as evidence until a retention period is decided.
 
-## Run the tests (Git Bash)
+## API
+
+| Route | Who | Auth |
+| --- | --- | --- |
+| `POST /juniors/measurements` | trainer | Cognito login (invoicing user pool) |
+| `POST /juniors/consent/withdraw` | trainer | Cognito login |
+| `POST /juniors/consent` | parent | none — the single-use token in the link is the authorisation |
+
+## Deploy (Git Bash)
+
+1. Tables (same command as before; it adds the three new tables to the existing stack):
 
 ```bash
-python -m venv .venv
-source .venv/Scripts/activate
-pip install pytest boto3 moto aws-cdk-lib constructs
-python -m pytest -q juniors/tests
+cd infra
+aws cloudformation deploy --template-file clients-stack.yaml --stack-name pt-studio-clients \
+  --parameter-overrides InvoicingTableName="$INVOICING_TABLE" \
+  --capabilities CAPABILITY_NAMED_IAM --profile pt
 ```
 
-## Wire into the existing stack
+2. Find the invoicing app's Cognito user pool and app client IDs:
 
-```python
-from juniors.juniors_construct import JuniorsConstruct
-
-juniors = JuniorsConstruct(self, "Juniors", trainees_table=trainees_table)
+```bash
+aws cognito-idp list-user-pools --max-results 10 --profile pt --region eu-west-2
+aws cognito-idp list-user-pool-clients --user-pool-id <pool id> --profile pt --region eu-west-2
 ```
 
-Then add routes to the existing HTTP API:
+3. Lambdas and API. `--guided` asks for the three new parameters and saves them
+   to `samconfig.toml`; accept the other saved answers:
 
-- `POST /juniors/measurements` → `juniors.measurement_fn` (Cognito authoriser)
-- `POST /juniors/consent/withdraw` → `juniors.consent_withdraw_fn` (Cognito authoriser)
-- `POST /juniors/consent` → `juniors.consent_submit_fn` (public; the token is the auth)
+```bash
+sam build
+sam deploy --guided --profile pt
+```
 
-Adjust `TRAINEES_TABLE`'s key in `handler.py` if your trainee table's partition
-key isn't `trainee_id`.
+   The new `JuniorsApiUrl` output is the base URL for the consent/measure app.
+
+## Run the tests
+
+```bash
+python -m pytest -q tests/juniors
+```
 
 ## Still to do
 
-- **Send consent request**: create a `JuniorConsentRequests` row with
-  `new_consent_request()` and email the link via the existing mailer.
+- **Send consent request**: create a `pt-junior-consent-requests` row with
+  `new_consent_request()` and email the link via the invoicing mailer.
 - **Front end**: parent consent page, trainer status panel, phone measure screen.
 - **Khamis-Roche %PAH**: transcribe the coefficient tables from Khamis & Roche
   (1994), verify them, and pass `percent_pah` into `assess()`. Staging already
   prefers %PAH when supplied.
-- **Retention policy**: decide how long measurements are kept after a junior
-  leaves or consent is withdrawn.
+- **Retention policy**: how long the consent log and measurements are kept after a
+  junior leaves or consent is withdrawn.
+- **Restrict CORS**: set `JuniorsAllowedOrigin` to the app's URL once it's hosted.

@@ -35,6 +35,12 @@ def make_tables(ddb):
         TableName="pt-health-profiles", BillingMode="PAY_PER_REQUEST",
         AttributeDefinitions=[{"AttributeName": "trainee_id", "AttributeType": "S"}],
         KeySchema=[{"AttributeName": "trainee_id", "KeyType": "HASH"}])
+    ddb.create_table(
+        TableName="pt-growth-measurements", BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "trainee_id", "AttributeType": "S"},
+                              {"AttributeName": "sk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "trainee_id", "KeyType": "HASH"},
+                   {"AttributeName": "sk", "KeyType": "RANGE"}])
     inv = ddb.create_table(
         TableName="invoicing", BillingMode="PAY_PER_REQUEST",
         AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
@@ -246,6 +252,19 @@ class ErasureTests(SyncTestCase):
             cloud_sync.delete_trainee(cid, self.ddb)
             self.assertIsNone(self.cloud("pt-trainees", cid))
             self.assertIsNone(self.cloud("pt-health-profiles", cid))
+
+    def test_delete_trainee_removes_junior_growth_data(self):
+        with self.machine("a"):
+            cid = db.create_client("Sam", "Young", "male", "2013-05-01")
+            self.sync()
+            growth = self.ddb.Table("pt-growth-measurements")
+            for sk in ("PROFILE", "2026-09-20#a", "2026-10-20#b"):
+                growth.put_item(Item={"trainee_id": cid, "sk": sk})
+            growth.put_item(Item={"trainee_id": "someone-else", "sk": "PROFILE"})
+            cloud_sync.delete_trainee(cid, self.ddb)
+            from boto3.dynamodb.conditions import Key
+            self.assertEqual(growth.query(KeyConditionExpression=Key("trainee_id").eq(cid))["Count"], 0)
+            self.assertEqual(growth.scan()["Count"], 1)
 
 
 if __name__ == "__main__":

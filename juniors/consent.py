@@ -19,7 +19,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Mapping
 
-from .maturity import is_junior
+try:
+    from .maturity import is_junior
+except ImportError:  # deployed: juniors/ is the Lambda root, so modules sit flat
+    from maturity import is_junior
 
 # Bump this whenever the consent wording changes. Older versions stop counting
 # as active, which forces a re-consent request.

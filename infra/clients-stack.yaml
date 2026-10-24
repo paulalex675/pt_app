@@ -60,6 +60,73 @@ Resources:
       KeySchema:
         - { AttributeName: trainee_id, KeyType: HASH }
 
+  # ---- Juniors (under-18s): consent log, consent links, growth measurements ----
+  # Read and written only by the juniors Lambdas in template.yaml. PT Studio's
+  # sync policy below deliberately has no access to them.
+
+  # Append-only consent log. sk = "<consent_type>#<granted_at>". Withdrawal stamps
+  # withdrawn_at on the row; rows are never deleted by the app (audit trail).
+  JuniorConsentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: pt-junior-consents
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: trainee_id, AttributeType: S }
+        - { AttributeName: sk,         AttributeType: S }
+      KeySchema:
+        - { AttributeName: trainee_id, KeyType: HASH }
+        - { AttributeName: sk,         KeyType: RANGE }
+
+  # Single-use links emailed to parents. Keyed by the SHA-256 of the token (the
+  # token itself is never stored); TTL removes rows 14 days after issue.
+  JuniorConsentRequestsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: pt-junior-consent-requests
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: token_hash, AttributeType: S }
+      KeySchema:
+        - { AttributeName: token_hash, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+  # Monthly measurements: sk = "<measured_on>#<measurement_id>" so a query returns
+  # visits in date order. One extra item per junior, sk = "PROFILE", holds the
+  # mid-parent height. All of a junior's growth data is in one partition.
+  GrowthMeasurementsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: pt-growth-measurements
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: trainee_id, AttributeType: S }
+        - { AttributeName: sk,         AttributeType: S }
+      KeySchema:
+        - { AttributeName: trainee_id, KeyType: HASH }
+        - { AttributeName: sk,         KeyType: RANGE }
+
   # What PT Studio's sync is allowed to do - nothing more. Attach it to the
   # pt-uploader permission set in IAM Identity Center as a customer managed policy
   # named PtStudioSync. No delete (erasure is an admin action), and the invoicing
@@ -93,3 +160,9 @@ Outputs:
     Value: !Ref HealthProfilesTable
   SyncPolicyName:
     Value: !Ref SyncPolicy
+  JuniorConsentsTableName:
+    Value: !Ref JuniorConsentsTable
+  JuniorConsentRequestsTableName:
+    Value: !Ref JuniorConsentRequestsTable
+  GrowthMeasurementsTableName:
+    Value: !Ref GrowthMeasurementsTable

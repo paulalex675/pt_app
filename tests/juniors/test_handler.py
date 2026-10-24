@@ -10,10 +10,11 @@ import pytest
 from moto import mock_aws
 
 TABLES = {
-    "TRAINEES_TABLE": ("Trainees", "trainee_id", None),
-    "CONSENTS_TABLE": ("JuniorConsents", "trainee_id", "sk"),
-    "CONSENT_REQUESTS_TABLE": ("JuniorConsentRequests", "token_hash", None),
-    "MEASUREMENTS_TABLE": ("GrowthMeasurements", "trainee_id", "sk"),
+    "TRAINEES_TABLE": ("pt-trainees", "trainee_id", None),
+    "HEALTH_TABLE": ("pt-health-profiles", "trainee_id", None),
+    "CONSENTS_TABLE": ("pt-junior-consents", "trainee_id", "sk"),
+    "CONSENT_REQUESTS_TABLE": ("pt-junior-consent-requests", "token_hash", None),
+    "MEASUREMENTS_TABLE": ("pt-growth-measurements", "trainee_id", "sk"),
 }
 
 
@@ -32,9 +33,11 @@ def h():
                 attrs.append({"AttributeName": sk, "AttributeType": "S"})
             ddb.create_table(TableName=name, KeySchema=keys,
                              AttributeDefinitions=attrs, BillingMode="PAY_PER_REQUEST")
-        ddb.Table("Trainees").put_item(Item={
-            "trainee_id": "t1", "name": "Test Junior",
-            "date_of_birth": "2013-05-01", "sex": "male"})
+        # Same shape cloud_sync._push writes.
+        ddb.Table("pt-trainees").put_item(Item={
+            "trainee_id": "t1", "first_name": "Test", "last_name": "Junior"})
+        ddb.Table("pt-health-profiles").put_item(Item={
+            "trainee_id": "t1", "dob": "2013-05-01", "sex": "male"})
         import juniors.handler as handler
         yield importlib.reload(handler), ddb
 
@@ -48,7 +51,7 @@ def send_link(ddb, days=14):
     from juniors.consent import new_consent_request
     req = new_consent_request()
     expires = int((datetime.now(timezone.utc) + timedelta(days=days)).timestamp())
-    ddb.Table("JuniorConsentRequests").put_item(
+    ddb.Table("pt-junior-consent-requests").put_item(
         Item={"token_hash": req.token_hash, "trainee_id": "t1", "expires_at": expires})
     return req.token
 
@@ -72,9 +75,13 @@ def test_full_flow_consent_then_measure_then_withdraw(h):
         "parent_a_height_cm": 180, "parent_b_height_cm": 165})
     assert status == 200 and set(body["recorded"]) == {"training", "growth_measurements"}
 
-    trainee = ddb.Table("Trainees").get_item(Key={"trainee_id": "t1"})["Item"]
-    assert float(trainee["mid_parent_height_cm"]) == 172.5
-    assert "parent_a_height_cm" not in trainee
+    profile = ddb.Table("pt-growth-measurements").get_item(
+        Key={"trainee_id": "t1", "sk": "PROFILE"})["Item"]
+    assert float(profile["mid_parent_height_cm"]) == 172.5
+    assert "parent_a_height_cm" not in profile
+    # The health profile PT Studio overwrites on sync is left alone.
+    assert "mid_parent_height_cm" not in ddb.Table("pt-health-profiles").get_item(
+        Key={"trainee_id": "t1"})["Item"]
 
     # Link is single use.
     status, _ = call(handler.consent_submit_handler, {
@@ -109,3 +116,47 @@ def test_bad_sitting_height_rejected(h):
         "granted": ["growth_measurements"]})
     status, body = call(handler.measurement_handler, {**MEASURE, "sitting_height_cm": 16.0})
     assert status == 400
+
+
+def test_profile_item_is_not_treated_as_a_measurement(h):
+    handler, ddb = h
+    token = send_link(ddb)
+    call(handler.consent_submit_handler, {
+        "token": token, "given_by": "Jane", "relationship": "mother",
+        "granted": ["growth_measurements"],
+        "parent_a_height_cm": 180, "parent_b_height_cm": 165})
+    status, body = call(handler.measurement_handler, MEASURE)
+    assert status == 201
+    assert body["growth_cm_per_month"] is None   # first real measurement, no history
+
+
+def test_monthly_growth_rate_from_previous_visit(h):
+    handler, ddb = h
+    token = send_link(ddb)
+    call(handler.consent_submit_handler, {
+        "token": token, "given_by": "Jane", "relationship": "mother",
+        "granted": ["growth_measurements"]})
+    last_month = (date.today() - timedelta(days=30)).isoformat()
+    assert call(handler.measurement_handler,
+                {**MEASURE, "measured_on": last_month, "height_cm": 159.0})[0] == 201
+    status, body = call(handler.measurement_handler, MEASURE)
+    assert status == 201
+    assert body["growth_cm_per_month"] == pytest.approx(1.01, abs=0.02)
+    assert "rapid_growth" in body["flags"]
+
+
+def test_unknown_trainee_404(h):
+    handler, _ = h
+    status, _ = call(handler.measurement_handler, {**MEASURE, "trainee_id": "nobody"})
+    assert status == 404
+
+
+def test_missing_dob_or_other_sex_422(h):
+    handler, ddb = h
+    ddb.Table("pt-trainees").put_item(Item={"trainee_id": "t2", "first_name": "A"})
+    status, body = call(handler.measurement_handler, {**MEASURE, "trainee_id": "t2"})
+    assert status == 422 and "date of birth" in body["error"]
+    ddb.Table("pt-health-profiles").put_item(
+        Item={"trainee_id": "t2", "dob": "2013-05-01", "sex": "other"})
+    status, body = call(handler.measurement_handler, {**MEASURE, "trainee_id": "t2"})
+    assert status == 422 and "male or female" in body["error"]
